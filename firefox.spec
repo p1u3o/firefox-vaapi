@@ -169,7 +169,7 @@ Patch427:        mozilla-1607404-fix-remote-offset.patch
 
 # Wayland specific upstream patches
 Patch574:        firefox-pipewire.patch
-
+Patch575:        vaapi.patch
 # PGO/LTO patches
 Patch600:        pgo.patch
 Patch601:        mozilla-1516081.patch
