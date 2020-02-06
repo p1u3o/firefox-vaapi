@@ -1,0 +1,2504 @@
+diff --git a/dom/media/platforms/ffmpeg/FFmpegDataDecoder.cpp b/dom/media/platforms/ffmpeg/FFmpegDataDecoder.cpp
+--- a/dom/media/platforms/ffmpeg/FFmpegDataDecoder.cpp
++++ b/dom/media/platforms/ffmpeg/FFmpegDataDecoder.cpp
+@@ -22,34 +22,63 @@ FFmpegDataDecoder<LIBAV_VER>::FFmpegData
+                                                 TaskQueue* aTaskQueue,
+                                                 AVCodecID aCodecID)
+     : mLib(aLib),
+       mCodecContext(nullptr),
+       mCodecParser(nullptr),
+       mFrame(NULL),
+       mExtraData(nullptr),
+       mCodecID(aCodecID),
++#ifdef MOZ_WAYLAND_VAAPI
++      mUseVAAPIDecode(true),
++      mVAAPIDeviceContext(nullptr),
++#endif
+       mTaskQueue(aTaskQueue),
+       mLastInputDts(media::TimeUnit::FromNegativeInfinity()) {
+   MOZ_ASSERT(aLib);
+   MOZ_COUNT_CTOR(FFmpegDataDecoder);
+ }
+ 
+ FFmpegDataDecoder<LIBAV_VER>::~FFmpegDataDecoder() {
+   MOZ_COUNT_DTOR(FFmpegDataDecoder);
+   if (mCodecParser) {
+     mLib->av_parser_close(mCodecParser);
+     mCodecParser = nullptr;
+   }
+ }
+ 
++#ifdef MOZ_WAYLAND_VAAPI
++bool FFmpegDataDecoder<LIBAV_VER>::CreateVAAPIDeviceContext()
++{
++  if (mLib->av_hwdevice_ctx_create(&mVAAPIDeviceContext, AV_HWDEVICE_TYPE_VAAPI,
++                                   NULL, NULL, 0) < 0) {
++    FFMPEG_LOG("Failed to create VAAPI device.");
++    return false;
++  }
++  mCodecContext->hw_device_ctx = mLib->av_buffer_ref(mVAAPIDeviceContext);
++  return true;
++}
++#endif
++
+ MediaResult FFmpegDataDecoder<LIBAV_VER>::InitDecoder() {
+   FFMPEG_LOG("Initialising FFmpeg decoder.");
+ 
+-  AVCodec* codec = FindAVCodec(mLib, mCodecID);
++  AVCodec* codec = nullptr;
++
++#ifdef MOZ_WAYLAND_VAAPI
++  if (mUseVAAPIDecode) {
++    codec = FindVAAPICodec(mCodecID);
++    mUseVAAPIDecode = !!codec;
++  }
++#endif
++
++  if (!codec) {
++    codec = FindAVCodec(mLib, mCodecID);
++  }
++
+   if (!codec) {
+     return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                        RESULT_DETAIL("Couldn't find ffmpeg decoder"));
+   }
+ 
+   StaticMutexAutoLock mon(sMonitor);
+ 
+   if (!(mCodecContext = mLib->avcodec_alloc_context3(codec))) {
+@@ -63,16 +92,22 @@ MediaResult FFmpegDataDecoder<LIBAV_VER>
+     if (mCodecParser) {
+       mCodecParser->flags |= ParserFlags();
+     }
+   }
+   mCodecContext->opaque = this;
+ 
+   InitCodecContext();
+ 
++#ifdef MOZ_WAYLAND_VAAPI
++  if (mUseVAAPIDecode) {
++    mUseVAAPIDecode = CreateVAAPIDeviceContext();
++  }
++#endif
++
+   if (mExtraData) {
+     mCodecContext->extradata_size = mExtraData->Length();
+     // FFmpeg may use SIMD instructions to access the data which reads the
+     // data in 32 bytes block. Must ensure we have enough data to read.
+     uint32_t padding_size =
+ #if LIBAVCODEC_VERSION_MAJOR >= 58
+         AV_INPUT_BUFFER_PADDING_SIZE;
+ #else
+@@ -211,16 +246,22 @@ FFmpegDataDecoder<LIBAV_VER>::ProcessFlu
+     mCodecParser = mLib->av_parser_init(mCodecID);
+   }
+   return FlushPromise::CreateAndResolve(true, __func__);
+ }
+ 
+ void FFmpegDataDecoder<LIBAV_VER>::ProcessShutdown() {
+   StaticMutexAutoLock mon(sMonitor);
+ 
++#ifdef MOZ_WAYLAND_VAAPI
++  if (mVAAPIDeviceContext) {
++    mLib->av_buffer_unref(&mVAAPIDeviceContext);
++    mVAAPIDeviceContext = nullptr;
++  }
++#endif
+   if (mCodecContext) {
+     if (mCodecContext->extradata) {
+       mLib->av_freep(&mCodecContext->extradata);
+     }
+     mLib->avcodec_close(mCodecContext);
+     mLib->av_freep(&mCodecContext);
+ #if LIBAVCODEC_VERSION_MAJOR >= 55
+     mLib->av_frame_free(&mFrame);
+@@ -253,9 +294,34 @@ AVFrame* FFmpegDataDecoder<LIBAV_VER>::P
+   return mFrame;
+ }
+ 
+ /* static */ AVCodec* FFmpegDataDecoder<LIBAV_VER>::FindAVCodec(
+     FFmpegLibWrapper* aLib, AVCodecID aCodec) {
+   return aLib->avcodec_find_decoder(aCodec);
+ }
+ 
++#ifdef MOZ_WAYLAND_VAAPI
++AVCodec* FFmpegDataDecoder<LIBAV_VER>::FindVAAPICodec(AVCodecID aCodec) {
++
++  if (aCodec != AV_CODEC_ID_H264) {
++    return nullptr;
++  }
++
++  AVCodec* decoder = mLib->avcodec_find_decoder(aCodec);
++  for (int i = 0;; i++) {
++    const AVCodecHWConfig *config = mLib->avcodec_get_hw_config(decoder, i);
++    if (!config) {
++      break;
++    }
++    if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
++      config->device_type == AV_HWDEVICE_TYPE_VAAPI) {
++      return decoder;
++      //mVAAPIPixelFormat = config->pix_fmt;
++    }
++  }
++
++  FFMPEG_LOG("Decoder does not support VAAPI device type.");
++  return nullptr;
++}
++#endif
++
+ }  // namespace mozilla
+diff --git a/dom/media/platforms/ffmpeg/FFmpegDataDecoder.h b/dom/media/platforms/ffmpeg/FFmpegDataDecoder.h
+--- a/dom/media/platforms/ffmpeg/FFmpegDataDecoder.h
++++ b/dom/media/platforms/ffmpeg/FFmpegDataDecoder.h
+@@ -34,16 +34,20 @@ class FFmpegDataDecoder<LIBAV_VER>
+ 
+   RefPtr<InitPromise> Init() override = 0;
+   RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+   RefPtr<DecodePromise> Drain() override;
+   RefPtr<FlushPromise> Flush() override;
+   RefPtr<ShutdownPromise> Shutdown() override;
+ 
+   static AVCodec* FindAVCodec(FFmpegLibWrapper* aLib, AVCodecID aCodec);
++#ifdef MOZ_WAYLAND_VAAPI
++  AVCodec* FindVAAPICodec(AVCodecID aCodec);
++  bool CreateVAAPIDeviceContext();
++#endif
+ 
+  protected:
+   // Flush and Drain operation, always run
+   virtual RefPtr<FlushPromise> ProcessFlush();
+   virtual void ProcessShutdown();
+   virtual void InitCodecContext() {}
+   AVFrame* PrepareFrame();
+   MediaResult InitDecoder();
+@@ -52,16 +56,20 @@ class FFmpegDataDecoder<LIBAV_VER>
+ 
+   FFmpegLibWrapper* mLib;
+ 
+   AVCodecContext* mCodecContext;
+   AVCodecParserContext* mCodecParser;
+   AVFrame* mFrame;
+   RefPtr<MediaByteBuffer> mExtraData;
+   AVCodecID mCodecID;
++#ifdef MOZ_WAYLAND_VAAPI
++  bool mUseVAAPIDecode;
++  AVBufferRef *mVAAPIDeviceContext;
++#endif
+ 
+  private:
+   RefPtr<DecodePromise> ProcessDecode(MediaRawData* aSample);
+   RefPtr<DecodePromise> ProcessDrain();
+   virtual MediaResult DoDecode(MediaRawData* aSample, uint8_t* aData, int aSize,
+                                bool* aGotFrame,
+                                MediaDataDecoder::DecodedData& aOutResults) = 0;
+   virtual bool NeedParser() const { return false; }
+diff --git a/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp b/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp
+--- a/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp
++++ b/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp
+@@ -17,16 +17,23 @@
+ 
+ namespace mozilla {
+ 
+ FFmpegLibWrapper::LinkResult FFmpegLibWrapper::Link() {
+   if (!mAVCodecLib || !mAVUtilLib) {
+     Unlink();
+     return LinkResult::NoProvidedLib;
+   }
++#ifdef MOZ_WAYLAND
++  // TODO -> optional
++  if (!mVALib) {
++    Unlink();
++    return LinkResult::NoProvidedLib;
++  }
++#endif
+ 
+   avcodec_version =
+       (decltype(avcodec_version))PR_FindSymbol(mAVCodecLib, "avcodec_version");
+   if (!avcodec_version) {
+     Unlink();
+     return LinkResult::NoAVCodecVersion;
+   }
+   uint32_t version = avcodec_version();
+@@ -147,19 +154,44 @@ FFmpegLibWrapper::LinkResult FFmpegLibWr
+   AV_FUNC(av_frame_alloc, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 |
+                            AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
+   AV_FUNC(av_frame_free, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 |
+                           AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
+   AV_FUNC(av_frame_unref, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 |
+                            AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
+   AV_FUNC_OPTION(av_frame_get_colorspace, AV_FUNC_AVUTIL_ALL)
+   AV_FUNC_OPTION(av_frame_get_color_range, AV_FUNC_AVUTIL_ALL)
++  AV_FUNC(av_hwdevice_find_type_by_name, AV_FUNC_58)
++  AV_FUNC(av_hwdevice_iterate_types, AV_FUNC_58)
++  AV_FUNC(av_hwdevice_get_type_name, AV_FUNC_58)
++  AV_FUNC(avcodec_get_hw_config, AV_FUNC_58)
++  AV_FUNC(av_hwdevice_ctx_create, AV_FUNC_58)
++  AV_FUNC(av_buffer_ref, AV_FUNC_AVUTIL_58)
++  AV_FUNC(av_buffer_unref, AV_FUNC_AVUTIL_58)
++#ifdef MOZ_WAYLAND
++  AV_FUNC_OPTION(av_hwframe_transfer_get_formats, AV_FUNC_58)
++  AV_FUNC_OPTION(av_frame_copy_props, AV_FUNC_58)
++  AV_FUNC_OPTION(av_hwdevice_ctx_create_derived, AV_FUNC_58)
++  AV_FUNC_OPTION(av_hwframe_map, AV_FUNC_58)
++  AV_FUNC_OPTION(av_hwframe_ctx_alloc, AV_FUNC_58)
++#endif
+ #undef AV_FUNC
+ #undef AV_FUNC_OPTION
+ 
++#ifdef MOZ_WAYLAND
++#define VA_FUNC(func)                                            \
++  if (!(func = (decltype(func))PR_FindSymbol(mVALib, #func))) {  \
++    FFMPEG_LOG("Couldn't load function " #func);                 \
++  }
++
++  VA_FUNC(vaExportSurfaceHandle)
++  VA_FUNC(vaSyncSurface)
++#undef VA_FUNC
++#endif
++
+   avcodec_register_all();
+   if (MOZ_LOG_TEST(sPDMLog, LogLevel::Debug)) {
+     av_log_set_level(AV_LOG_DEBUG);
+   } else if (MOZ_LOG_TEST(sPDMLog, LogLevel::Info)) {
+     av_log_set_level(AV_LOG_INFO);
+   } else {
+     av_log_set_level(0);
+   }
+@@ -174,12 +206,17 @@ void FFmpegLibWrapper::Unlink() {
+     av_lockmgr_register(nullptr);
+   }
+   if (mAVUtilLib && mAVUtilLib != mAVCodecLib) {
+     PR_UnloadLibrary(mAVUtilLib);
+   }
+   if (mAVCodecLib) {
+     PR_UnloadLibrary(mAVCodecLib);
+   }
++#ifdef MOZ_WAYLAND
++  if (mVALib) {
++    PR_UnloadLibrary(mVALib);
++  }
++#endif
+   PodZero(this);
+ }
+ 
+ }  // namespace mozilla
+diff --git a/dom/media/platforms/ffmpeg/FFmpegLibWrapper.h b/dom/media/platforms/ffmpeg/FFmpegLibWrapper.h
+--- a/dom/media/platforms/ffmpeg/FFmpegLibWrapper.h
++++ b/dom/media/platforms/ffmpeg/FFmpegLibWrapper.h
+@@ -11,16 +11,24 @@
+ 
+ struct AVCodec;
+ struct AVCodecContext;
+ struct AVFrame;
+ struct AVPacket;
+ struct AVDictionary;
+ struct AVCodecParserContext;
+ struct PRLibrary;
++#ifdef MOZ_WAYLAND
++struct AVCodecHWConfig;
++struct AVBufferRef;
++typedef void* VADisplay;
++typedef unsigned int VASurfaceID;
++typedef int HWDeviceType;
++typedef int VAStatus;
++#endif
+ 
+ namespace mozilla {
+ 
+ struct MOZ_ONLY_USED_TO_AVOID_STATIC_CONSTRUCTORS FFmpegLibWrapper {
+   // The class is used only in static storage and so is zero initialized.
+   FFmpegLibWrapper() = default;
+   // The libraries are not unloaded in the destructor, because doing so would
+   // require a static constructor to register the static destructor.  As the
+@@ -35,17 +43,18 @@ struct MOZ_ONLY_USED_TO_AVOID_STATIC_CON
+     CannotUseLibAV57,
+     BlockedOldLibAVVersion,
+     UnknownFutureLibAVVersion,
+     UnknownFutureFFMpegVersion,
+     UnknownOlderFFMpegVersion,
+     MissingFFMpegFunction,
+     MissingLibAVFunction,
+   };
+-  // Examine mAVCodecLib and mAVUtilLib, and attempt to resolve all symbols.
++  // Examine mAVCodecLib and mAVUtilLib, (TODO)
++  // and attempt to resolve all symbols.
+   // Upon failure, the entire object will be reset and any attached libraries
+   // will be unlinked.
+   LinkResult Link();
+ 
+   // Reset the wrapper and unlink all attached libraries.
+   void Unlink();
+ 
+   // indicate the version of libavcodec linked to.
+@@ -79,16 +88,39 @@ struct MOZ_ONLY_USED_TO_AVOID_STATIC_CON
+   void (*avcodec_get_frame_defaults)(AVFrame* pic);
+   // libavcodec v54 only
+   void (*avcodec_free_frame)(AVFrame** frame);
+ 
+   // libavcodec v58 and later only
+   int (*avcodec_send_packet)(AVCodecContext* avctx, const AVPacket* avpkt);
+   int (*avcodec_receive_frame)(AVCodecContext* avctx, AVFrame* frame);
+ 
++#ifdef MOZ_WAYLAND
++  HWDeviceType (*av_hwdevice_find_type_by_name)(const char *name);
++  HWDeviceType (*av_hwdevice_iterate_types)(HWDeviceType prev);
++  const char* (*av_hwdevice_get_type_name)(HWDeviceType type);
++  const AVCodecHWConfig *(*avcodec_get_hw_config)(const AVCodec *codec,
++                                                  int index);
++  int (*av_hwdevice_ctx_create)(AVBufferRef **device_ctx,
++                                HWDeviceType type,
++                                const char *device,
++                                AVDictionary *opts, int flags);
++  AVBufferRef* (*av_buffer_ref)(AVBufferRef *buf);
++  void (*av_buffer_unref)(AVBufferRef **buf);
++  int (*av_hwframe_transfer_data)(AVFrame *dst, const AVFrame *src, int flags);
++  int (*av_hwframe_transfer_get_formats)(AVBufferRef *hwframe_ctx,
++                                         int dir, int **formats, int flags);
++  int (*av_frame_copy_props)(AVFrame *dst, const AVFrame *src);
++  int (*av_hwdevice_ctx_create_derived)(AVBufferRef **dst_ctx,
++                                        int type, AVBufferRef *src_ctx,
++                                        int flags);
++  int (*av_hwframe_map)(AVFrame *dst, const AVFrame *src, int flags);
++  AVBufferRef * (*av_hwframe_ctx_alloc)(AVBufferRef *device_ctx);
++#endif
++
+   // libavcodec optional
+   AvRdftInitFn av_rdft_init;
+   AvRdftCalcFn av_rdft_calc;
+   AvRdftEndFn av_rdft_end;
+ 
+   // libavutil
+   void (*av_log_set_level)(int level);
+   void* (*av_malloc)(size_t size);
+@@ -97,17 +129,27 @@ struct MOZ_ONLY_USED_TO_AVOID_STATIC_CON
+   // libavutil v55 and later only
+   AVFrame* (*av_frame_alloc)();
+   void (*av_frame_free)(AVFrame** frame);
+   void (*av_frame_unref)(AVFrame* frame);
+ 
+   // libavutil optional
+   int (*av_frame_get_colorspace)(const AVFrame* frame);
+   int (*av_frame_get_color_range)(const AVFrame* frame);
++
++#ifdef MOZ_WAYLAND
++  VAStatus (*vaExportSurfaceHandle)(VADisplay, VASurfaceID, uint32_t,
++                                    uint32_t, void *);
++  VAStatus (*vaSyncSurface)(VADisplay, VASurfaceID);
++#endif
++
+   PRLibrary* mAVCodecLib;
+   PRLibrary* mAVUtilLib;
++#ifdef MOZ_WAYLAND
++  PRLibrary* mVALib;
++#endif
+ 
+  private:
+ };
+ 
+ }  // namespace mozilla
+ 
+ #endif  // FFmpegLibWrapper
+diff --git a/dom/media/platforms/ffmpeg/FFmpegLibs.h b/dom/media/platforms/ffmpeg/FFmpegLibs.h
+--- a/dom/media/platforms/ffmpeg/FFmpegLibs.h
++++ b/dom/media/platforms/ffmpeg/FFmpegLibs.h
+@@ -9,16 +9,19 @@
+ 
+ extern "C" {
+ #ifdef __GNUC__
+ #  pragma GCC visibility push(default)
+ #endif
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/avutil.h"
+ #include "libavutil/mem.h"
++#ifdef MOZ_WAYLAND_VAAPI
++#include "libavutil/hwcontext_vaapi.h"
++#endif
+ #ifdef __GNUC__
+ #  pragma GCC visibility pop
+ #endif
+ }
+ 
+ #if LIBAVCODEC_VERSION_MAJOR < 55
+ #  define AV_CODEC_ID_VP6F CODEC_ID_VP6F
+ #  define AV_CODEC_ID_H264 CODEC_ID_H264
+diff --git a/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp b/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp
+--- a/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp
++++ b/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp
+@@ -48,16 +48,26 @@ static const char* sLibs[] = {
+ };
+ 
+ /* static */
+ bool FFmpegRuntimeLinker::Init() {
+   if (sLinkStatus != LinkStatus_INIT) {
+     return sLinkStatus == LinkStatus_SUCCEEDED;
+   }
+ 
++#ifdef MOZ_WAYLAND
++  {
++    const char* lib = "libva.so.2";
++    PRLibSpec lspec;
++    lspec.type = PR_LibSpec_Pathname;
++    lspec.value.pathname = lib;
++    sLibAV.mVALib = PR_LoadLibraryWithFlags(lspec, PR_LD_NOW | PR_LD_LOCAL);
++  }
++#endif
++
+   // While going through all possible libs, this status will be updated with a
+   // more precise error if possible.
+   sLinkStatus = LinkStatus_NOT_FOUND;
+ 
+   for (size_t i = 0; i < ArrayLength(sLibs); i++) {
+     const char* lib = sLibs[i];
+     PRLibSpec lspec;
+     lspec.type = PR_LibSpec_Pathname;
+diff --git a/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp b/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp
+--- a/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp
++++ b/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp
+@@ -6,16 +6,20 @@
+ 
+ #include "FFmpegVideoDecoder.h"
+ #include "FFmpegLog.h"
+ #include "ImageContainer.h"
+ #include "MP4Decoder.h"
+ #include "MediaInfo.h"
+ #include "VPXDecoder.h"
+ #include "mozilla/layers/KnowsCompositor.h"
++#ifdef MOZ_WAYLAND_VAAPI
++#include "mozilla/layers/WaylandDMABUFSurfaceImage.h"
++#include <dlfcn.h>
++#endif
+ 
+ #include "libavutil/pixfmt.h"
+ #if LIBAVCODEC_VERSION_MAJOR < 54
+ #  define AVPixelFormat PixelFormat
+ #  define AV_PIX_FMT_YUV420P PIX_FMT_YUV420P
+ #  define AV_PIX_FMT_YUVJ420P PIX_FMT_YUVJ420P
+ #  define AV_PIX_FMT_YUV420P10LE PIX_FMT_YUV420P10LE
+ #  define AV_PIX_FMT_YUV422P PIX_FMT_YUV422P
+@@ -42,16 +46,21 @@ using media::TimeUnit;
+  * For now, we just look for YUV420P, YUVJ420P and YUV444 as those are the only
+  * only non-HW accelerated format supported by FFmpeg's H264 and VP9 decoder.
+  */
+ static AVPixelFormat ChoosePixelFormat(AVCodecContext* aCodecContext,
+                                        const AVPixelFormat* aFormats) {
+   FFMPEG_LOG("Choosing FFmpeg pixel format for video decoding.");
+   for (; *aFormats > -1; aFormats++) {
+     switch (*aFormats) {
++#ifdef MOZ_WAYLAND_VAAPI
++      case AV_PIX_FMT_VAAPI_VLD:
++        FFMPEG_LOG("Requesting pixel format VAAPI_VLD\n");
++        return AV_PIX_FMT_VAAPI_VLD;
++#endif
+       case AV_PIX_FMT_YUV420P:
+         FFMPEG_LOG("Requesting pixel format YUV420P.");
+         return AV_PIX_FMT_YUV420P;
+       case AV_PIX_FMT_YUVJ420P:
+         FFMPEG_LOG("Requesting pixel format YUVJ420P.");
+         return AV_PIX_FMT_YUVJ420P;
+       case AV_PIX_FMT_YUV420P10LE:
+         FFMPEG_LOG("Requesting pixel format YUV420P10LE.");
+@@ -220,18 +229,28 @@ MediaResult FFmpegVideoDecoder<LIBAV_VER
+     if (res == AVERROR(EAGAIN)) {
+       return NS_OK;
+     }
+     if (res < 0) {
+       FFMPEG_LOG("avcodec_receive_frame error: %d", res);
+       return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                          RESULT_DETAIL("avcodec_receive_frame error: %d", res));
+     }
+-    MediaResult rv = CreateImage(mFrame->pkt_pos, mFrame->pkt_pts,
+-                                 mFrame->pkt_duration, aResults);
++
++    MediaResult rv;
++#ifdef MOZ_WAYLAND_VAAPI
++    if (mUseVAAPIDecode && mFrame->format == AV_PIX_FMT_VAAPI_VLD) {
++      rv = CreateWaylandDMABUFImage(mFrame->pkt_pos, mFrame->pkt_pts,
++                                    mFrame->pkt_duration, aResults);
++    } else
++#endif
++    {
++      rv = CreateImage(mFrame->pkt_pos, mFrame->pkt_pts,
++                       mFrame->pkt_duration, aResults);
++    }
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+     if (aGotFrame) {
+       *aGotFrame = true;
+     }
+   } while (true);
+ #else
+@@ -406,16 +425,82 @@ MediaResult FFmpegVideoDecoder<LIBAV_VER
+   if (!v) {
+     return MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                        RESULT_DETAIL("image allocation error"));
+   }
+   aResults.AppendElement(std::move(v));
+   return NS_OK;
+ }
+ 
++#ifdef MOZ_WAYLAND_VAAPI
++MediaResult FFmpegVideoDecoder<LIBAV_VER>::CreateWaylandDMABUFImage(
++    int64_t aOffset, int64_t aPts, int64_t aDuration,
++    MediaDataDecoder::DecodedData& aResults) {
++  FFMPEG_LOG("Got one VAAPI frame output with pts=%" PRId64 " dts=%" PRId64
++             " duration=%" PRId64 " opaque=%" PRId64,
++             aPts, mFrame->pkt_dts, aDuration, mCodecContext->reordered_opaque);
++
++  AVHWDeviceContext* device_ctx =
++    (AVHWDeviceContext*)mVAAPIDeviceContext->data;
++  AVVAAPIDeviceContext* VAAPIDeviceContext =
++    (AVVAAPIDeviceContext*)device_ctx->hwctx;
++  VADRMPRIMESurfaceDescriptor va_desc;
++
++  VASurfaceID surface_id = (VASurfaceID)(uintptr_t)mFrame->data[3];
++  VAStatus vas =
++    mLib->vaExportSurfaceHandle(VAAPIDeviceContext->display, surface_id,
++                                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
++                                VA_EXPORT_SURFACE_READ_ONLY |
++                                VA_EXPORT_SURFACE_SEPARATE_LAYERS,
++                                &va_desc);
++  if (vas != VA_STATUS_SUCCESS) {
++    // back to SW
++  }
++  mLib->vaSyncSurface(VAAPIDeviceContext->display, surface_id);
++
++  RefPtr<WaylandDMABufSurface> surface =
++    WaylandDMABufSurface::CreateYUVSurface(va_desc);
++
++  if (mLib->av_frame_get_colorspace) {
++    switch (mLib->av_frame_get_colorspace(mFrame)) {
++      case AVCOL_SPC_BT2020_NCL:
++      case AVCOL_SPC_BT2020_CL:
++        surface->SetYUVColorSpace(gfx::YUVColorSpace::BT2020);
++        break;
++      case AVCOL_SPC_BT709:
++        surface->SetYUVColorSpace(gfx::YUVColorSpace::BT709);
++        break;
++      case AVCOL_SPC_SMPTE170M:
++      case AVCOL_SPC_BT470BG:
++        surface->SetYUVColorSpace(gfx::YUVColorSpace::BT601);
++        break;
++      case AVCOL_SPC_UNSPECIFIED:
++      default:
++        surface->SetYUVColorSpace(gfx::YUVColorSpace::UNKNOWN);
++        break;
++        break;
++    }
++  }
++
++  RefPtr<layers::Image> image = new layers::WaylandDMABUFSurfaceImage(surface);
++  //mInfo.ScaledImageRect(mFrame->width, mFrame->height), mImageAllocator);
++
++  RefPtr<VideoData> v = VideoData::CreateFromImage(mInfo.mDisplay, aOffset,
++      TimeUnit::FromMicroseconds(aPts), TimeUnit::FromMicroseconds(aDuration),
++      image, !!mFrame->key_frame, TimeUnit::FromMicroseconds(-1));
++
++  if (!v) {
++    return MediaResult(NS_ERROR_OUT_OF_MEMORY,
++                       RESULT_DETAIL("image allocation error"));
++  }
++  aResults.AppendElement(std::move(v));
++  return NS_OK;
++}
++#endif
++
+ RefPtr<MediaDataDecoder::FlushPromise>
+ FFmpegVideoDecoder<LIBAV_VER>::ProcessFlush() {
+   mPtsContext.Reset();
+   mDurationMap.Clear();
+   return FFmpegDataDecoder::ProcessFlush();
+ }
+ 
+ AVCodecID FFmpegVideoDecoder<LIBAV_VER>::GetCodecId(
+diff --git a/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.h b/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.h
+--- a/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.h
++++ b/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.h
+@@ -64,16 +64,21 @@ class FFmpegVideoDecoder<LIBAV_VER>
+         mCodecID == AV_CODEC_ID_VP9 ||
+ #  endif
+         mCodecID == AV_CODEC_ID_VP8;
+ #endif
+   }
+ 
+   MediaResult CreateImage(int64_t aOffset, int64_t aPts, int64_t aDuration,
+                           MediaDataDecoder::DecodedData& aResults);
++#ifdef MOZ_WAYLAND_VAAPI
++  MediaResult CreateWaylandDMABUFImage(int64_t aOffset, int64_t aPts,
++                          int64_t aDuration,
++                          MediaDataDecoder::DecodedData& aResults);
++#endif
+ 
+   /**
+    * This method allocates a buffer for FFmpeg's decoder, wrapped in an Image.
+    * Currently it only supports Planar YUV420, which appears to be the only
+    * non-hardware accelerated image format that FFmpeg's H264 decoder is
+    * capable of outputting.
+    */
+   int AllocateYUV420PVideoBuffer(AVCodecContext* aCodecContext,
+diff --git a/dom/media/platforms/ffmpeg/ffmpeg58/include/libavutil/hwcontext_vaapi.h b/dom/media/platforms/ffmpeg/ffmpeg58/include/libavutil/hwcontext_vaapi.h
+new file mode 100644
+--- /dev/null
++++ b/dom/media/platforms/ffmpeg/ffmpeg58/include/libavutil/hwcontext_vaapi.h
+@@ -0,0 +1,117 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVUTIL_HWCONTEXT_VAAPI_H
++#define AVUTIL_HWCONTEXT_VAAPI_H
++
++#include <va/va.h>
++
++/**
++ * @file
++ * API-specific header for AV_HWDEVICE_TYPE_VAAPI.
++ *
++ * Dynamic frame pools are supported, but note that any pool used as a render
++ * target is required to be of fixed size in order to be be usable as an
++ * argument to vaCreateContext().
++ *
++ * For user-allocated pools, AVHWFramesContext.pool must return AVBufferRefs
++ * with the data pointer set to a VASurfaceID.
++ */
++
++enum {
++    /**
++     * The quirks field has been set by the user and should not be detected
++     * automatically by av_hwdevice_ctx_init().
++     */
++    AV_VAAPI_DRIVER_QUIRK_USER_SET = (1 << 0),
++    /**
++     * The driver does not destroy parameter buffers when they are used by
++     * vaRenderPicture().  Additional code will be required to destroy them
++     * separately afterwards.
++     */
++    AV_VAAPI_DRIVER_QUIRK_RENDER_PARAM_BUFFERS = (1 << 1),
++
++    /**
++     * The driver does not support the VASurfaceAttribMemoryType attribute,
++     * so the surface allocation code will not try to use it.
++     */
++    AV_VAAPI_DRIVER_QUIRK_ATTRIB_MEMTYPE = (1 << 2),
++
++    /**
++     * The driver does not support surface attributes at all.
++     * The surface allocation code will never pass them to surface allocation,
++     * and the results of the vaQuerySurfaceAttributes() call will be faked.
++     */
++    AV_VAAPI_DRIVER_QUIRK_SURFACE_ATTRIBUTES = (1 << 3),
++};
++
++/**
++ * VAAPI connection details.
++ *
++ * Allocated as AVHWDeviceContext.hwctx
++ */
++typedef struct AVVAAPIDeviceContext {
++    /**
++     * The VADisplay handle, to be filled by the user.
++     */
++    VADisplay display;
++    /**
++     * Driver quirks to apply - this is filled by av_hwdevice_ctx_init(),
++     * with reference to a table of known drivers, unless the
++     * AV_VAAPI_DRIVER_QUIRK_USER_SET bit is already present.  The user
++     * may need to refer to this field when performing any later
++     * operations using VAAPI with the same VADisplay.
++     */
++    unsigned int driver_quirks;
++} AVVAAPIDeviceContext;
++
++/**
++ * VAAPI-specific data associated with a frame pool.
++ *
++ * Allocated as AVHWFramesContext.hwctx.
++ */
++typedef struct AVVAAPIFramesContext {
++    /**
++     * Set by the user to apply surface attributes to all surfaces in
++     * the frame pool.  If null, default settings are used.
++     */
++    VASurfaceAttrib *attributes;
++    int           nb_attributes;
++    /**
++     * The surfaces IDs of all surfaces in the pool after creation.
++     * Only valid if AVHWFramesContext.initial_pool_size was positive.
++     * These are intended to be used as the render_targets arguments to
++     * vaCreateContext().
++     */
++    VASurfaceID     *surface_ids;
++    int           nb_surfaces;
++} AVVAAPIFramesContext;
++
++/**
++ * VAAPI hardware pipeline configuration details.
++ *
++ * Allocated with av_hwdevice_hwconfig_alloc().
++ */
++typedef struct AVVAAPIHWConfig {
++    /**
++     * ID of a VAAPI pipeline configuration.
++     */
++    VAConfigID config_id;
++} AVVAAPIHWConfig;
++
++#endif /* AVUTIL_HWCONTEXT_VAAPI_H */
+diff --git a/dom/media/platforms/ffmpeg/ffmpeg58/moz.build b/dom/media/platforms/ffmpeg/ffmpeg58/moz.build
+--- a/dom/media/platforms/ffmpeg/ffmpeg58/moz.build
++++ b/dom/media/platforms/ffmpeg/ffmpeg58/moz.build
+@@ -17,9 +17,15 @@ LOCAL_INCLUDES += [
+ 
+ if CONFIG['CC_TYPE'] in ('clang', 'gcc'):
+   CXXFLAGS += [ '-Wno-deprecated-declarations' ]
+ if CONFIG['CC_TYPE'] == 'clang':
+   CXXFLAGS += [
+     '-Wno-unknown-attributes',
+   ]
+ 
++if CONFIG['MOZ_WAYLAND']:
++  CXXFLAGS += CONFIG['TK_CFLAGS']
++  CXXFLAGS += CONFIG['MOZ_WAYLAND_CFLAGS']
++  DEFINES['MOZ_WAYLAND_VAAPI'] = 1
++  include('/ipc/chromium/chromium-config.mozbuild')
++
+ FINAL_LIBRARY = 'xul'
+diff --git a/gfx/gl/GLBlitHelper.cpp b/gfx/gl/GLBlitHelper.cpp
+--- a/gfx/gl/GLBlitHelper.cpp
++++ b/gfx/gl/GLBlitHelper.cpp
+@@ -716,17 +716,21 @@ bool GLBlitHelper::BlitImageToFramebuffe
+ #else
+     case ImageFormat::GPU_VIDEO:
+     case ImageFormat::D3D11_SHARE_HANDLE_TEXTURE:
+     case ImageFormat::D3D11_YCBCR_IMAGE:
+     case ImageFormat::D3D9_RGB32_TEXTURE:
+       MOZ_ASSERT(false);
+       return false;
+ #endif
+-
++#ifdef MOZ_WAYLAND
++    case ImageFormat::WAYLAND_DMABUF:
++      MOZ_ASSERT(false);
++      return false;
++#endif
+     case ImageFormat::CAIRO_SURFACE:
+     case ImageFormat::NV_IMAGE:
+     case ImageFormat::OVERLAY_IMAGE:
+     case ImageFormat::SHARED_RGB:
+     case ImageFormat::TEXTURE_WRAPPER:
+       return false;  // todo
+   }
+   return false;
+diff --git a/gfx/gl/SharedSurfaceDMABUF.cpp b/gfx/gl/SharedSurfaceDMABUF.cpp
+--- a/gfx/gl/SharedSurfaceDMABUF.cpp
++++ b/gfx/gl/SharedSurfaceDMABUF.cpp
+@@ -26,17 +26,17 @@ SharedSurface_DMABUF::SharedSurface_DMAB
+     : SharedSurface(SharedSurfaceType::EGLSurfaceDMABUF,
+                     AttachmentType::GLTexture, gl, size, hasAlpha, true) {
+   WaylandDMABufSurfaceFlags flags =
+       hasAlpha ? static_cast<WaylandDMABufSurfaceFlags>(
+                      DMABUF_TEXTURE | DMABUF_USE_MODIFIERS | DMABUF_ALPHA)
+                : static_cast<WaylandDMABufSurfaceFlags>(DMABUF_TEXTURE |
+                                                         DMABUF_USE_MODIFIERS);
+   mSurface =
+-      WaylandDMABufSurface::CreateDMABufSurface(size.width, size.height, flags);
++      WaylandDMABufSurface::CreateRGBASurface(size.width, size.height, flags);
+   if (mSurface) {
+     mSurface->CreateEGLImage(gl);
+   }
+ }
+ 
+ SharedSurface_DMABUF::~SharedSurface_DMABUF() {
+   if (!mGL || !mGL->MakeCurrent()) {
+     return;
+diff --git a/gfx/layers/ImageContainer.h b/gfx/layers/ImageContainer.h
+--- a/gfx/layers/ImageContainer.h
++++ b/gfx/layers/ImageContainer.h
+@@ -163,16 +163,18 @@ struct ImageBackendData {
+ 
+ /* Forward declarations for Image derivatives. */
+ class GLImage;
+ class SharedRGBImage;
+ #ifdef MOZ_WIDGET_ANDROID
+ class SurfaceTextureImage;
+ #elif defined(XP_MACOSX)
+ class MacIOSurfaceImage;
++#elif MOZ_WAYLAND
++class WaylandDMABUFSurfaceImage;
+ #endif
+ 
+ /**
+  * A class representing a buffer of pixel data. The data can be in one
+  * of various formats including YCbCr.
+  *
+  * Create an image using an ImageContainer. Fill the image with data, and
+  * then call ImageContainer::SetImage to display it. An image must not be
+@@ -223,16 +225,19 @@ class Image {
+   virtual GLImage* AsGLImage() { return nullptr; }
+ #ifdef MOZ_WIDGET_ANDROID
+   virtual SurfaceTextureImage* AsSurfaceTextureImage() { return nullptr; }
+ #endif
+ #ifdef XP_MACOSX
+   virtual MacIOSurfaceImage* AsMacIOSurfaceImage() { return nullptr; }
+ #endif
+   virtual PlanarYCbCrImage* AsPlanarYCbCrImage() { return nullptr; }
++#ifdef MOZ_WAYLAND
++  virtual WaylandDMABUFSurfaceImage* AsWaylandDMABUFSurfaceImage() { return nullptr; }
++#endif
+ 
+   virtual NVImage* AsNVImage() { return nullptr; }
+ 
+  protected:
+   Image(void* aImplData, ImageFormat aFormat)
+       : mImplData(aImplData), mSerial(++sSerialCounter), mFormat(aFormat) {}
+ 
+   // Protected destructor, to discourage deletion outside of Release():
+diff --git a/gfx/layers/ImageTypes.h b/gfx/layers/ImageTypes.h
+--- a/gfx/layers/ImageTypes.h
++++ b/gfx/layers/ImageTypes.h
+@@ -84,17 +84,23 @@ enum class ImageFormat {
+    * A D3D11 backed YUV image.
+    */
+   D3D11_YCBCR_IMAGE,
+ 
+   /**
+    * An opaque handle that refers to an Image stored in the GPU
+    * process.
+    */
+-  GPU_VIDEO
++  GPU_VIDEO,
++
++  /**
++   * The WAYLAND_DMABUF format creates a SharedDMABUFImage, which stores YUV data in
++   * DMABUF memory. Used on Wayland by VAAPI decoder.
++   */
++  WAYLAND_DMABUF,
+ };
+ 
+ enum class StereoMode {
+   MONO,
+   LEFT_RIGHT,
+   RIGHT_LEFT,
+   BOTTOM_TOP,
+   TOP_BOTTOM,
+diff --git a/gfx/layers/WaylandDMABUFSurfaceImage.cpp b/gfx/layers/WaylandDMABUFSurfaceImage.cpp
+new file mode 100644
+--- /dev/null
++++ b/gfx/layers/WaylandDMABUFSurfaceImage.cpp
+@@ -0,0 +1,28 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++//#include "MacIOSurfaceHelpers.h"
++#include "WaylandDMABUFSurfaceImage.h"
++#include "gfxPlatform.h"
++#include "mozilla/layers/CompositableClient.h"
++#include "mozilla/layers/CompositableForwarder.h"
++#include "mozilla/layers/WaylandDMABUFTextureClientOGL.h"
++#include "mozilla/UniquePtr.h"
++
++using namespace mozilla;
++using namespace mozilla::layers;
++using namespace mozilla::gfx;
++
++TextureClient* WaylandDMABUFSurfaceImage::GetTextureClient(
++    KnowsCompositor* aKnowsCompositor) {
++  if (!mTextureClient) {
++    BackendType backend = BackendType::NONE;
++    mTextureClient = TextureClient::CreateWithData(
++        WaylandDMABUFTextureData::Create(mSurface, backend),
++        TextureFlags::DEFAULT, aKnowsCompositor->GetTextureForwarder());
++  }
++  return mTextureClient;
++}
+diff --git a/gfx/layers/WaylandDMABUFSurfaceImage.h b/gfx/layers/WaylandDMABUFSurfaceImage.h
+new file mode 100644
+--- /dev/null
++++ b/gfx/layers/WaylandDMABUFSurfaceImage.h
+@@ -0,0 +1,45 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef WAYLAND_SURFACE_DMABUF_H
++#define WAYLAND_SURFACE_DMABUF_H
++
++#include "ImageContainer.h"
++#include "mozilla/widget/WaylandDMABufSurface.h"
++#include "mozilla/gfx/Point.h"
++#include "mozilla/layers/TextureClient.h"
++
++namespace mozilla {
++
++namespace layers {
++
++class WaylandDMABUFSurfaceImage : public Image {
++ public:
++  explicit WaylandDMABUFSurfaceImage(WaylandDMABufSurface* aSurface)
++      : Image(nullptr, ImageFormat::WAYLAND_DMABUF), mSurface(aSurface) {}
++
++  WaylandDMABufSurface* GetSurface() { return mSurface; }
++
++  gfx::IntSize GetSize() const override {
++    return gfx::IntSize::Truncate(mSurface->GetWidth(),
++                                  mSurface->GetHeight());
++  }
++
++  already_AddRefed<gfx::SourceSurface> GetAsSourceSurface() override {
++    return nullptr;
++  }
++
++  TextureClient* GetTextureClient(KnowsCompositor* aKnowsCompositor) override;
++
++ private:
++  RefPtr<WaylandDMABufSurface> mSurface;
++  RefPtr<TextureClient> mTextureClient;
++};
++
++}  // namespace layers
++}  // namespace mozilla
++
++#endif  // WAYLAND_SURFACE_DMABUF_H
+diff --git a/gfx/layers/ipc/LayersSurfaces.ipdlh b/gfx/layers/ipc/LayersSurfaces.ipdlh
+--- a/gfx/layers/ipc/LayersSurfaces.ipdlh
++++ b/gfx/layers/ipc/LayersSurfaces.ipdlh
+@@ -55,25 +55,27 @@ struct SurfaceDescriptorDXGIYCbCr {
+ struct SurfaceDescriptorMacIOSurface {
+   uint32_t surfaceId;
+   double scaleFactor;
+   bool isOpaque;
+   YUVColorSpace yUVColorSpace;
+ };
+ 
+ struct SurfaceDescriptorDMABuf {
+-  uint32_t width;
+-  uint32_t height;
+-  uint32_t format;
++  uint32_t bufferType;
++  uint32_t numPlanes;
+   uint64_t modifier;
+   uint32_t flags;
+-  uint32_t numFds;
++  uint32_t[] width;
++  uint32_t[] height;
++  uint32_t[] format;
+   FileDescriptor[] fds;
+   uint32_t[] strides;
+   uint32_t[] offsets;
++  YUVColorSpace yUVColorSpace;
+ };
+ 
+ struct SurfaceTextureDescriptor {
+   uint64_t handle;
+   IntSize size;
+   SurfaceFormat format;
+   bool continuous;
+   bool ignoreTransform;
+@@ -93,16 +95,17 @@ struct SurfaceDescriptorSharedGLTexture 
+   IntSize size;
+   bool hasAlpha;
+ };
+ 
+ 
+ union RemoteDecoderVideoSubDescriptor {
+   SurfaceDescriptorD3D10;
+   SurfaceDescriptorDXGIYCbCr;
++  SurfaceDescriptorDMABuf;
+   null_t;
+ };
+ 
+ struct SurfaceDescriptorRemoteDecoder {
+   uint64_t handle;
+   RemoteDecoderVideoSubDescriptor subdesc;
+   MaybeVideoBridgeSource source;
+ };
+diff --git a/gfx/layers/moz.build b/gfx/layers/moz.build
+--- a/gfx/layers/moz.build
++++ b/gfx/layers/moz.build
+@@ -294,20 +294,22 @@ if CONFIG['MOZ_X11']:
+         'ipc/ShadowLayerUtilsX11.cpp',
+         'opengl/X11TextureSourceOGL.cpp',
+     ]
+ 
+ if CONFIG['MOZ_WAYLAND']:
+     EXPORTS.mozilla.layers += [
+         'opengl/WaylandDMABUFTextureClientOGL.h',
+         'opengl/WaylandDMABUFTextureHostOGL.h',
++        'WaylandDMABUFSurfaceImage.h',
+     ]
+     SOURCES += [
+         'opengl/WaylandDMABUFTextureClientOGL.cpp',
+         'opengl/WaylandDMABUFTextureHostOGL.cpp',
++        'WaylandDMABUFSurfaceImage.cpp',
+     ]
+ 
+ if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'cocoa':
+     EXPORTS.mozilla.layers += [
+         'NativeLayerCA.h',
+         'SurfacePoolCA.h',
+         'TextureSync.h',
+     ]
+diff --git a/gfx/layers/opengl/CompositorOGL.cpp b/gfx/layers/opengl/CompositorOGL.cpp
+--- a/gfx/layers/opengl/CompositorOGL.cpp
++++ b/gfx/layers/opengl/CompositorOGL.cpp
+@@ -1229,17 +1229,18 @@ ShaderConfigOGL CompositorOGL::GetShader
+       config.SetColorMultiplier(
+           RescalingFactorForColorDepth(effectYCbCr->mColorDepth));
+       config.SetTextureTarget(
+           effectYCbCr->mTexture->AsSourceOGL()->GetTextureTarget());
+       break;
+     }
+     case EffectTypes::NV12:
+       config.SetNV12(true);
+-      config.SetTextureTarget(LOCAL_GL_TEXTURE_RECTANGLE_ARB);
++//      config.SetTextureTarget(LOCAL_GL_TEXTURE_RECTANGLE_ARB);
++      config.SetTextureTarget(LOCAL_GL_TEXTURE_2D);
+       break;
+     case EffectTypes::COMPONENT_ALPHA: {
+       config.SetComponentAlpha(true);
+       EffectComponentAlpha* effectComponentAlpha =
+           static_cast<EffectComponentAlpha*>(aEffect);
+       gfx::SurfaceFormat format = effectComponentAlpha->mOnWhite->GetFormat();
+       config.SetRBSwap(format == gfx::SurfaceFormat::B8G8R8A8 ||
+                        format == gfx::SurfaceFormat::B8G8R8X8);
+diff --git a/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.cpp b/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.cpp
+--- a/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.cpp
++++ b/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.cpp
+@@ -29,21 +29,26 @@ WaylandDMABUFTextureData::~WaylandDMABUF
+     NS_WARNING("WaylandDMABUFTextureData::Create() - wrong surface format!");
+     return nullptr;
+   }
+ 
+   int flags = DMABUF_TEXTURE;
+   if (aFormat == SurfaceFormat::B8G8R8A8) {
+     flags |= DMABUF_ALPHA;
+   }
+-  RefPtr<WaylandDMABufSurface> surf = WaylandDMABufSurface::CreateDMABufSurface(
++  RefPtr<WaylandDMABufSurface> surf = WaylandDMABufSurface::CreateRGBASurface(
+       aSize.width, aSize.height, flags);
+   return new WaylandDMABUFTextureData(surf, aBackend);
+ }
+ 
++/* static */ WaylandDMABUFTextureData* WaylandDMABUFTextureData::Create(
++  WaylandDMABufSurface* aSurface, gfx::BackendType aBackend) {
++  return new WaylandDMABUFTextureData(aSurface, aBackend);
++}
++
+ TextureData* WaylandDMABUFTextureData::CreateSimilar(
+     LayersIPCChannel* aAllocator, LayersBackend aLayersBackend,
+     TextureFlags aFlags, TextureAllocationFlags aAllocFlags) const {
+   return WaylandDMABUFTextureData::Create(
+       gfx::IntSize(mSurface->GetWidth(), mSurface->GetHeight()),
+       mSurface->GetFormat(), mBackend);
+ }
+ 
+diff --git a/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.h b/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.h
+--- a/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.h
++++ b/gfx/layers/opengl/WaylandDMABUFTextureClientOGL.h
+@@ -14,16 +14,18 @@ class WaylandDMABufSurface;
+ namespace mozilla {
+ namespace layers {
+ 
+ class WaylandDMABUFTextureData : public TextureData {
+  public:
+   static WaylandDMABUFTextureData* Create(const gfx::IntSize& aSize,
+                                           gfx::SurfaceFormat aFormat,
+                                           gfx::BackendType aBackend);
++  static WaylandDMABUFTextureData* Create(WaylandDMABufSurface* aSurface,
++                                          gfx::BackendType aBackend);
+   ~WaylandDMABUFTextureData();
+ 
+   virtual TextureData* CreateSimilar(
+       LayersIPCChannel* aAllocator, LayersBackend aLayersBackend,
+       TextureFlags aFlags = TextureFlags::DEFAULT,
+       TextureAllocationFlags aAllocFlags = ALLOC_DEFAULT) const override;
+ 
+   void FillInfo(TextureData::Info& aInfo) const override;
+diff --git a/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.cpp b/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.cpp
+--- a/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.cpp
++++ b/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.cpp
+@@ -14,40 +14,74 @@
+ namespace mozilla {
+ namespace layers {
+ 
+ WaylandDMABUFTextureHostOGL::WaylandDMABUFTextureHostOGL(
+     TextureFlags aFlags, const SurfaceDescriptor& aDesc)
+     : TextureHost(aFlags) {
+   MOZ_COUNT_CTOR(WaylandDMABUFTextureHostOGL);
+ 
+-  mSurface = WaylandDMABufSurface::CreateDMABufSurface(
++  mSurface = WaylandDMABufSurface::CreateSurface(
+       aDesc.get_SurfaceDescriptorDMABuf());
+ }
+ 
+ WaylandDMABUFTextureHostOGL::~WaylandDMABUFTextureHostOGL() {
+   MOZ_COUNT_DTOR(WaylandDMABUFTextureHostOGL);
+   if (mProvider) {
+     DeallocateDeviceData();
+   }
+ }
+ 
++GLTextureSource* WaylandDMABUFTextureHostOGL::CreateTextureSourceForPlane(
++    size_t aPlane) {
++  MOZ_ASSERT(mSurface);
++
++  if (!mSurface->CreateEGLImage(gl(), aPlane)) {
++    return nullptr;
++  }
++
++  return new GLTextureSource(
++      mProvider, mSurface->GetGLTexture(aPlane), LOCAL_GL_TEXTURE_2D,
++      gfx::IntSize(mSurface->GetWidth(aPlane),
++                   mSurface->GetHeight(aPlane)),
++      // XXX: This isn't really correct (but isn't used), we should be using the
++      // format of the individual plane, not of the whole buffer.
++      mSurface->GetFormat());
++}
++
+ bool WaylandDMABUFTextureHostOGL::Lock() {
+   if (!gl() || !gl()->MakeCurrent() || !mSurface) {
+     return false;
+   }
+ 
+-  if (!mTextureSource && mSurface->CreateEGLImage(gl())) {
++  if (mTextureSource) {
++    return true;
++  }
++/*
++  if (mSurface->GetPlaneCount() == 1) {
++    if (!mSurface->CreateEGLImage(gl())) {
++      return false;
++    }
+     auto format = mSurface->HasAlpha() ? gfx::SurfaceFormat::R8G8B8A8
+                                        : gfx::SurfaceFormat::R8G8B8X8;
+     mTextureSource = new EGLImageTextureSource(
+         mProvider, mSurface->GetEGLImage(), format, LOCAL_GL_TEXTURE_2D,
+         LOCAL_GL_CLAMP_TO_EDGE,
+         gfx::IntSize(mSurface->GetWidth(), mSurface->GetHeight()));
+-  }
++  } else {
++*/
++    mTextureSource = CreateTextureSourceForPlane(0);
++
++    RefPtr<TextureSource> prev = mTextureSource;
++    for (size_t i = 1; i < mSurface->GetPlaneCount(); i++) {
++      RefPtr<TextureSource> next = CreateTextureSourceForPlane(i);
++      prev->SetNextSibling(next);
++      prev = next;
++    }
++//  }
+   return true;
+ }
+ 
+ void WaylandDMABUFTextureHostOGL::Unlock() {}
+ 
+ void WaylandDMABUFTextureHostOGL::DeallocateDeviceData() {
+   mTextureSource = nullptr;
+   if (mSurface) {
+@@ -85,16 +119,31 @@ gfx::IntSize WaylandDMABUFTextureHostOGL
+   }
+   return gfx::IntSize(mSurface->GetWidth(), mSurface->GetHeight());
+ }
+ 
+ gl::GLContext* WaylandDMABUFTextureHostOGL::gl() const {
+   return mProvider ? mProvider->GetGLContext() : nullptr;
+ }
+ 
++gfx::YUVColorSpace WaylandDMABUFTextureHostOGL::GetYUVColorSpace() const {
++  if (!mSurface) {
++    return gfx::YUVColorSpace::UNKNOWN;
++  }
++  return mSurface->GetYUVColorSpace();
++}
++
++gfx::ColorRange WaylandDMABUFTextureHostOGL::GetColorRange() const {
++  if (!mSurface) {
++    return gfx::ColorRange::LIMITED;
++  }
++  return mSurface->IsFullRange() ? gfx::ColorRange::FULL
++                                 : gfx::ColorRange::LIMITED;
++}
++
+ void WaylandDMABUFTextureHostOGL::CreateRenderTexture(
+     const wr::ExternalImageId& aExternalImageId) {
+   RefPtr<wr::RenderTextureHost> texture =
+       new wr::RenderWaylandDMABUFTextureHostOGL(mSurface);
+   wr::RenderThread::Get()->RegisterExternalImage(wr::AsUint64(aExternalImageId),
+                                                  texture.forget());
+ }
+ 
+diff --git a/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.h b/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.h
+--- a/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.h
++++ b/gfx/layers/opengl/WaylandDMABUFTextureHostOGL.h
+@@ -61,17 +61,24 @@ class WaylandDMABUFTextureHostOGL : publ
+                            const wr::ExternalImageId& aExtID,
+                            const bool aPreferCompositorSurface) override;
+ 
+   void PushDisplayItems(wr::DisplayListBuilder& aBuilder,
+                         const wr::LayoutRect& aBounds,
+                         const wr::LayoutRect& aClip, wr::ImageRendering aFilter,
+                         const Range<wr::ImageKey>& aImageKeys) override;
+ 
++  gfx::YUVColorSpace GetYUVColorSpace() const override;
++  gfx::ColorRange GetColorRange() const override;
++
++private:
++  GLTextureSource* CreateTextureSourceForPlane(size_t aPlane);
++
+  protected:
+-  RefPtr<EGLImageTextureSource> mTextureSource;
++  //RefPtr<EGLImageTextureSource> mTextureSource;
++  RefPtr<GLTextureSource> mTextureSource;
+   RefPtr<WaylandDMABufSurface> mSurface;
+ };
+ 
+ }  // namespace layers
+ }  // namespace mozilla
+ 
+ #endif  // MOZILLA_GFX_WAYLANDDMABUFTEXTUREHOSTOGL_H
+diff --git a/gfx/thebes/gfxUtils.cpp b/gfx/thebes/gfxUtils.cpp
+--- a/gfx/thebes/gfxUtils.cpp
++++ b/gfx/thebes/gfxUtils.cpp
+@@ -1140,17 +1140,17 @@ const float kBT2020NarrowYCbCrToRGB_RowM
+   switch (aYUVColorSpace) {
+     case gfx::YUVColorSpace::BT601:
+       return rec601;
+     case YUVColorSpace::BT709:
+       return rec709;
+     case YUVColorSpace::BT2020:
+       return rec2020;
+     default:  // YUVColorSpace::UNKNOWN
+-      MOZ_ASSERT(false, "unknown aYUVColorSpace");
++      //MOZ_ASSERT(false, "unknown aYUVColorSpace");
+       return rec601;
+   }
+ }
+ 
+ /* static */ const float* gfxUtils::YuvToRgbMatrix4x4ColumnMajor(
+     YUVColorSpace aYUVColorSpace) {
+ #define X(x)                                                             \
+   {                                                                      \
+@@ -1167,17 +1167,17 @@ const float kBT2020NarrowYCbCrToRGB_RowM
+   switch (aYUVColorSpace) {
+     case YUVColorSpace::BT601:
+       return rec601;
+     case YUVColorSpace::BT709:
+       return rec709;
+     case YUVColorSpace::BT2020:
+       return rec2020;
+     default:  // YUVColorSpace::UNKNOWN
+-      MOZ_ASSERT(false, "unknown aYUVColorSpace");
++      //MOZ_ASSERT(false, "unknown aYUVColorSpace");
+       return rec601;
+   }
+ }
+ 
+ /* static */
+ void gfxUtils::WriteAsPNG(SourceSurface* aSurface, const nsAString& aFile) {
+   WriteAsPNG(aSurface, NS_ConvertUTF16toUTF8(aFile).get());
+ }
+diff --git a/widget/gtk/WaylandDMABufSurface.cpp b/widget/gtk/WaylandDMABufSurface.cpp
+--- a/widget/gtk/WaylandDMABufSurface.cpp
++++ b/widget/gtk/WaylandDMABufSurface.cpp
+@@ -50,21 +50,23 @@ using namespace mozilla::layers;
+ #endif
+ #define BUFFER_FLAGS 0
+ 
+ #ifndef GBM_BO_USE_TEXTURING
+ #  define GBM_BO_USE_TEXTURING (1 << 5)
+ #endif
+ 
+ void WaylandDMABufSurface::SetWLBuffer(struct wl_buffer* aWLBuffer) {
+-  MOZ_ASSERT(mWLBuffer == nullptr, "WLBuffer already assigned!");
+-  mWLBuffer = aWLBuffer;
++  MOZ_ASSERT(mRGBA.mWLBuffer == nullptr, "WLBuffer already assigned!");
++  mRGBA.mWLBuffer = aWLBuffer;
+ }
+ 
+-wl_buffer* WaylandDMABufSurface::GetWLBuffer() { return mWLBuffer; }
++wl_buffer* WaylandDMABufSurface::GetWLBuffer() {
++  return mRGBA.mWLBuffer;
++}
+ 
+ static void buffer_release(void* data, wl_buffer* buffer) {
+   auto surface = reinterpret_cast<WaylandDMABufSurface*>(data);
+   surface->WLBufferDetach();
+ }
+ 
+ static const struct wl_buffer_listener buffer_listener = {buffer_release};
+ 
+@@ -88,419 +90,669 @@ static void buffer_created(void* data,
+ static void buffer_create_failed(void* data,
+                                  struct zwp_linux_buffer_params_v1* params) {
+   zwp_linux_buffer_params_v1_destroy(params);
+ }
+ 
+ static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+     buffer_created, buffer_create_failed};
+ 
+-WaylandDMABufSurface::WaylandDMABufSurface()
+-    : mWidth(0),
+-      mHeight(0),
+-      mGmbFormat(nullptr),
+-      mWLBuffer(nullptr),
+-      mMappedRegion(nullptr),
+-      mMappedRegionStride(0),
+-      mGbmBufferObject(nullptr),
+-      mBufferModifier(DRM_FORMAT_MOD_INVALID),
+-      mBufferPlaneCount(1),
+-      mGbmBufferFlags(0),
+-      mEGLImage(LOCAL_EGL_NO_IMAGE),
+-      mGLFbo(0),
+-      mWLBufferAttached(false),
+-      mFastWLBufferCreation(true) {
+-  for (int i = 0; i < DMABUF_BUFFER_PLANES; i++) {
+-    mDmabufFds[i] = -1;
+-    mStrides[i] = 0;
+-    mOffsets[i] = 0;
++WaylandDMABufSurface::WaylandDMABufSurface(BufferType aBufferType) {
++  memset(this, 0, sizeof(*this));
++
++  mBufferType = aBufferType;
++  mBufferModifier = DRM_FORMAT_MOD_INVALID;
++
++  switch (mBufferType) {
++    case BUFFER_RGBA:
++      mBufferPlaneCount = 1;
++      mRGBA.mFastWLBufferCreation = true;
++      mRGBA.mEGLImage = LOCAL_EGL_NO_IMAGE;
++      for (int i = 0; i < DMABUF_BUFFER_PLANES; i++) {
++        mRGBA.mDmabufFds[i] = -1;
++      }
++      break;
++    case BUFFER_YUV:
++      for (int i = 0; i < DMABUF_BUFFER_PLANES; i++) {
++        mYUV.mEGLImage[i] = LOCAL_EGL_NO_IMAGE;
++      }
++      mYUV.mDmabufFd = -1;
++      mYUV.mColorSpace = mozilla::gfx::YUVColorSpace::UNKNOWN;
++      break;
+   }
+ }
+ 
+-WaylandDMABufSurface::~WaylandDMABufSurface() { ReleaseDMABufSurface(); }
++WaylandDMABufSurface::~WaylandDMABufSurface() {
++  if (mBufferType == BUFFER_YUV) {
++    ReleaseYUVSurface();
++  } else {
++    ReleaseRGBASurface();
++  }
++}
+ 
+ bool WaylandDMABufSurface::Create(int aWidth, int aHeight,
+                                   int aWaylandDMABufSurfaceFlags) {
+-  MOZ_ASSERT(mGbmBufferObject == nullptr, "Already created?");
++  MOZ_ASSERT(mRGBA.mGbmBufferObject == nullptr, "Already created?");
+ 
+-  mSurfaceFlags = aWaylandDMABufSurfaceFlags;
+-  mWidth = aWidth;
+-  mHeight = aHeight;
++  mRGBA.mWidth = aWidth;
++  mRGBA.mHeight = aHeight;
++  mRGBA.mSurfaceFlags = aWaylandDMABufSurfaceFlags;
+ 
+   nsWaylandDisplay* display = WaylandDisplayGet();
+-  mGmbFormat = display->GetGbmFormat(mSurfaceFlags & DMABUF_ALPHA);
+-  if (!mGmbFormat) {
++  mRGBA.mGmbFormat = display->GetGbmFormat(mRGBA.mSurfaceFlags & DMABUF_ALPHA);
++  if (!mRGBA.mGmbFormat) {
+     // Requested DRM format is not supported.
+     return false;
+   }
+ 
++  mSurfaceFormat = HasAlpha() ? gfx::SurfaceFormat::B8G8R8A8
++                              : gfx::SurfaceFormat::B8G8R8X8;
++
+   bool useModifiers = (aWaylandDMABufSurfaceFlags & DMABUF_USE_MODIFIERS) &&
+                       nsGbmLib::IsModifierAvailable() &&
+-                      mGmbFormat->mModifiersCount > 0;
++                      mRGBA.mGmbFormat->mModifiersCount > 0;
+   if (useModifiers) {
+-    mGbmBufferObject = nsGbmLib::CreateWithModifiers(
+-        display->GetGbmDevice(), mWidth, mHeight, mGmbFormat->mFormat,
+-        mGmbFormat->mModifiers, mGmbFormat->mModifiersCount);
+-    if (mGbmBufferObject) {
+-      mBufferModifier = nsGbmLib::GetModifier(mGbmBufferObject);
++    mRGBA.mGbmBufferObject = nsGbmLib::CreateWithModifiers(
++        display->GetGbmDevice(), mRGBA.mWidth, mRGBA.mHeight,
++        mRGBA.mGmbFormat->mFormat,
++        mRGBA.mGmbFormat->mModifiers, mRGBA.mGmbFormat->mModifiersCount);
++    if (mRGBA.mGbmBufferObject) {
++      mBufferModifier = nsGbmLib::GetModifier(mRGBA.mGbmBufferObject);
+     }
+   }
+ 
+   // Create without modifiers - use plain/linear format.
+-  if (!mGbmBufferObject) {
+-    mGbmBufferFlags = (GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
+-    if (mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
+-      mGbmBufferFlags |= GBM_BO_USE_RENDERING;
+-    } else if (mSurfaceFlags & DMABUF_TEXTURE) {
+-      mGbmBufferFlags |= GBM_BO_USE_TEXTURING;
++  if (!mRGBA.mGbmBufferObject) {
++    mRGBA.mGbmBufferFlags = (GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
++    if (mRGBA.mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
++      mRGBA.mGbmBufferFlags |= GBM_BO_USE_RENDERING;
++    } else if (mRGBA.mSurfaceFlags & DMABUF_TEXTURE) {
++      mRGBA.mGbmBufferFlags |= GBM_BO_USE_TEXTURING;
+     }
+ 
+     if (!nsGbmLib::DeviceIsFormatSupported(
+-            display->GetGbmDevice(), mGmbFormat->mFormat, mGbmBufferFlags)) {
+-      mGbmBufferFlags &= ~GBM_BO_USE_SCANOUT;
++            display->GetGbmDevice(), mRGBA.mGmbFormat->mFormat, mRGBA.mGbmBufferFlags)) {
++      mRGBA.mGbmBufferFlags &= ~GBM_BO_USE_SCANOUT;
+     }
+ 
+-    mGbmBufferObject =
+-        nsGbmLib::Create(display->GetGbmDevice(), mWidth, mHeight,
+-                         mGmbFormat->mFormat, mGbmBufferFlags);
++    mRGBA.mGbmBufferObject =
++        nsGbmLib::Create(display->GetGbmDevice(), mRGBA.mWidth, mRGBA.mHeight,
++                         mRGBA.mGmbFormat->mFormat, mRGBA.mGbmBufferFlags);
+   }
+ 
+-  if (!mGbmBufferObject) {
++  if (!mRGBA.mGbmBufferObject) {
+     return false;
+   }
+ 
+   if (mBufferModifier != DRM_FORMAT_MOD_INVALID) {
+-    mBufferPlaneCount = nsGbmLib::GetPlaneCount(mGbmBufferObject);
++    mBufferPlaneCount = nsGbmLib::GetPlaneCount(mRGBA.mGbmBufferObject);
+     for (int i = 0; i < mBufferPlaneCount; i++) {
+-      uint32_t handle = nsGbmLib::GetHandleForPlane(mGbmBufferObject, i).u32;
++      uint32_t handle =
++        nsGbmLib::GetHandleForPlane(mRGBA.mGbmBufferObject, i).u32;
+       int ret = nsGbmLib::DrmPrimeHandleToFD(display->GetGbmDeviceFd(), handle,
+-                                             0, &mDmabufFds[i]);
+-      if (ret < 0 || mDmabufFds[i] < 0) {
+-        ReleaseDMABufSurface();
++                                             0, &mRGBA.mDmabufFds[i]);
++      if (ret < 0 || mRGBA.mDmabufFds[i] < 0) {
++        ReleaseRGBASurface();
+         return false;
+       }
+-      mStrides[i] = nsGbmLib::GetStrideForPlane(mGbmBufferObject, i);
+-      mOffsets[i] = nsGbmLib::GetOffset(mGbmBufferObject, i);
++      mRGBA.mStrides[i] =
++        nsGbmLib::GetStrideForPlane(mRGBA.mGbmBufferObject, i);
++      mRGBA.mOffsets[i] =
++        nsGbmLib::GetOffset(mRGBA.mGbmBufferObject, i);
+     }
+   } else {
+     mBufferPlaneCount = 1;
+-    mStrides[0] = nsGbmLib::GetStride(mGbmBufferObject);
+-    mDmabufFds[0] = nsGbmLib::GetFd(mGbmBufferObject);
+-    if (mDmabufFds[0] < 0) {
+-      ReleaseDMABufSurface();
++    mRGBA.mStrides[0] = nsGbmLib::GetStride(mRGBA.mGbmBufferObject);
++    mRGBA.mDmabufFds[0] = nsGbmLib::GetFd(mRGBA.mGbmBufferObject);
++    if (mRGBA.mDmabufFds[0] < 0) {
++      ReleaseRGBASurface();
+       return false;
+     }
+   }
+ 
+-  if (mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
++  if (mRGBA.mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
+     return CreateWLBuffer();
+   }
+ 
+   return true;
+ }
+ 
+-void WaylandDMABufSurface::FillFdData(struct gbm_import_fd_data& aData) {
+-  aData.fd = mDmabufFds[0];
+-  aData.width = mWidth;
+-  aData.height = mHeight;
+-  aData.stride = mStrides[0];
+-  aData.format = mGmbFormat->mFormat;
++void WaylandDMABufSurface::FillFdDataRGBA(struct gbm_import_fd_data& aData) {
++  aData.fd = mRGBA.mDmabufFds[0];
++  aData.width = mRGBA.mWidth;
++  aData.height = mRGBA.mHeight;
++  aData.stride = mRGBA.mStrides[0];
++  aData.format = mRGBA.mGmbFormat->mFormat;
+ }
+ 
+-void WaylandDMABufSurface::FillFdData(
++void WaylandDMABufSurface::FillFdDataRGBA(
+     struct gbm_import_fd_modifier_data& aData) {
+-  aData.width = mWidth;
+-  aData.height = mHeight;
+-  aData.format = mGmbFormat->mFormat;
++  aData.width = mRGBA.mWidth;
++  aData.height = mRGBA.mHeight;
++  aData.format = mRGBA.mGmbFormat->mFormat;
+   aData.num_fds = mBufferPlaneCount;
+   aData.modifier = mBufferModifier;
+ 
+   for (int i = 0; i < mBufferPlaneCount; i++) {
+-    aData.fds[i] = mDmabufFds[i];
+-    aData.strides[i] = mStrides[i];
+-    aData.offsets[i] = mOffsets[i];
++    aData.fds[i] = mRGBA.mDmabufFds[i];
++    aData.strides[i] = mRGBA.mStrides[i];
++    aData.offsets[i] = mRGBA.mOffsets[i];
+   }
+ }
+ 
+-void WaylandDMABufSurface::ImportSurfaceDescriptor(
+-    const SurfaceDescriptor& aDesc) {
+-  const SurfaceDescriptorDMABuf& desc = aDesc.get_SurfaceDescriptorDMABuf();
++void WaylandDMABufSurface::ImportSurfaceDescriptorRGBA(
++    const SurfaceDescriptorDMABuf& aDesc) {
+ 
+-  mWidth = desc.width();
+-  mHeight = desc.height();
+-  mGmbFormat = WaylandDisplayGet()->GetExactGbmFormat(desc.format());
+-  mBufferPlaneCount = desc.numFds();
+-  mBufferModifier = desc.modifier();
+-  mGbmBufferFlags = desc.flags();
++  mBufferType = BUFFER_RGBA;
++  mRGBA.mWidth = aDesc.width()[0];
++  mRGBA.mHeight = aDesc.height()[0];
++  mRGBA.mGmbFormat = WaylandDisplayGet()->GetExactGbmFormat(aDesc.format()[0]);
++  mBufferPlaneCount = aDesc.numPlanes();
++  mBufferModifier = aDesc.modifier();
++  mRGBA.mGbmBufferFlags = aDesc.flags();
+ 
+   for (int i = 0; i < mBufferPlaneCount; i++) {
+-    mDmabufFds[i] = desc.fds()[i].ClonePlatformHandle().release();
+-    mStrides[i] = desc.strides()[i];
+-    mOffsets[i] = desc.offsets()[i];
++    mRGBA.mDmabufFds[i] = aDesc.fds()[i].ClonePlatformHandle().release();
++    mRGBA.mStrides[i] = aDesc.strides()[i];
++    mRGBA.mOffsets[i] = aDesc.offsets()[i];
++  }
++}
++
++void WaylandDMABufSurface::ImportSurfaceDescriptorYUV(
++    const SurfaceDescriptorDMABuf& aDesc) {
++
++  mBufferType = BUFFER_YUV;
++  mSurfaceFormat = gfx::SurfaceFormat::NV12; // TODO!
++  mBufferPlaneCount = aDesc.numPlanes();
++  mBufferModifier = aDesc.modifier();
++  mYUV.mDmabufFd = aDesc.fds()[0].ClonePlatformHandle().release();
++  mYUV.mColorSpace = aDesc.yUVColorSpace();
++
++  for (int i = 0; i < mBufferPlaneCount; i++) {
++    mYUV.mWidth[i] = aDesc.width()[i];
++    mYUV.mHeight[i] = aDesc.height()[i];
++    mYUV.mDrmFormats[i] = aDesc.format()[i];
++    mYUV.mStrides[i] = aDesc.strides()[i];
++    mYUV.mOffsets[i] = aDesc.offsets()[i];
+   }
+ }
+ 
+ bool WaylandDMABufSurface::Create(const SurfaceDescriptor& aDesc) {
+-  MOZ_ASSERT(mGbmBufferObject == nullptr, "Already created?");
+-
+-  ImportSurfaceDescriptor(aDesc);
++  MOZ_ASSERT(mRGBA.mGbmBufferObject == nullptr, "Already created?");
+ 
+-  if (mBufferModifier != DRM_FORMAT_MOD_INVALID) {
+-    struct gbm_import_fd_modifier_data importData;
+-    FillFdData(importData);
+-    mGbmBufferObject = nsGbmLib::Import(WaylandDisplayGet()->GetGbmDevice(),
+-                                        GBM_BO_IMPORT_FD_MODIFIER, &importData,
+-                                        mGbmBufferFlags);
++  const SurfaceDescriptorDMABuf& dmaDesc = aDesc.get_SurfaceDescriptorDMABuf();
++  if (dmaDesc.bufferType() == BUFFER_RGBA) {
++    ImportSurfaceDescriptorRGBA(dmaDesc);
++    if (mBufferModifier != DRM_FORMAT_MOD_INVALID) {
++      struct gbm_import_fd_modifier_data importData;
++      FillFdDataRGBA(importData);
++      mRGBA.mGbmBufferObject = nsGbmLib::Import(WaylandDisplayGet()->GetGbmDevice(),
++                                          GBM_BO_IMPORT_FD_MODIFIER, &importData,
++                                          mRGBA.mGbmBufferFlags);
++    } else {
++      struct gbm_import_fd_data importData;
++      FillFdDataRGBA(importData);
++      mRGBA.mGbmBufferObject =
++          nsGbmLib::Import(WaylandDisplayGet()->GetGbmDevice(), GBM_BO_IMPORT_FD,
++                           &importData, mRGBA.mGbmBufferFlags);
++    }
++    if (!mRGBA.mGbmBufferObject) {
++      ReleaseRGBASurface();
++      return false;
++    }
+   } else {
+-    struct gbm_import_fd_data importData;
+-    FillFdData(importData);
+-    mGbmBufferObject =
+-        nsGbmLib::Import(WaylandDisplayGet()->GetGbmDevice(), GBM_BO_IMPORT_FD,
+-                         &importData, mGbmBufferFlags);
+-  }
+-
+-  if (!mGbmBufferObject) {
+-    ReleaseDMABufSurface();
+-    return false;
++    ImportSurfaceDescriptorYUV(dmaDesc);
+   }
+ 
+   return true;
+ }
+-
++/*
++  uint32_t[] width;
++  uint32_t[] height;
++  uint32_t[] format;
++  FileDescriptor[] fds;
++  uint32_t[] strides;
++  uint32_t[] offsets;
++*/
+ bool WaylandDMABufSurface::Serialize(
+     mozilla::layers::SurfaceDescriptor& aOutDescriptor) {
++
++  AutoTArray<uint32_t, DMABUF_BUFFER_PLANES> width;
++  AutoTArray<uint32_t, DMABUF_BUFFER_PLANES> height;
++  AutoTArray<uint32_t, DMABUF_BUFFER_PLANES> format;
+   AutoTArray<ipc::FileDescriptor, DMABUF_BUFFER_PLANES> fds;
+   AutoTArray<uint32_t, DMABUF_BUFFER_PLANES> strides;
+   AutoTArray<uint32_t, DMABUF_BUFFER_PLANES> offsets;
+ 
+-  for (int i = 0; i < mBufferPlaneCount; i++) {
+-    fds.AppendElement(ipc::FileDescriptor(mDmabufFds[i]));
+-    strides.AppendElement(mStrides[i]);
+-    offsets.AppendElement(mOffsets[i]);
++  if (mBufferType == BUFFER_RGBA) {
++    width.AppendElement(mRGBA.mWidth);
++    height.AppendElement(mRGBA.mHeight);
++    format.AppendElement(mRGBA.mGmbFormat->mFormat);
++    for (int i = 0; i < mBufferPlaneCount; i++) {
++      fds.AppendElement(ipc::FileDescriptor(mRGBA.mDmabufFds[i]));
++      strides.AppendElement(mRGBA.mStrides[i]);
++      offsets.AppendElement(mRGBA.mOffsets[i]);
++    }
++  } else  {
++    fds.AppendElement(ipc::FileDescriptor(mYUV.mDmabufFd));
++    for (int i = 0; i < mBufferPlaneCount; i++) {
++      width.AppendElement(mYUV.mWidth[i]);
++      height.AppendElement(mYUV.mHeight[i]);
++      format.AppendElement(mYUV.mDrmFormats[i]);
++      strides.AppendElement(mYUV.mStrides[i]);
++      offsets.AppendElement(mYUV.mOffsets[i]);
++    }
+   }
+ 
+   aOutDescriptor = SurfaceDescriptorDMABuf(
+-      mWidth, mHeight, mGmbFormat->mFormat, mBufferModifier, mGbmBufferFlags,
+-      mBufferPlaneCount, fds, strides, offsets);
++      mBufferType,
++      mBufferPlaneCount,
++      mBufferModifier,
++      mRGBA.mGbmBufferFlags,
++      width, height, format,
++      fds, strides, offsets,
++      mYUV.mColorSpace);
++
+   return true;
+ }
+ 
+ bool WaylandDMABufSurface::CreateWLBuffer() {
+   nsWaylandDisplay* display = WaylandDisplayGet();
+   struct zwp_linux_buffer_params_v1* params =
+       zwp_linux_dmabuf_v1_create_params(display->GetDmabuf());
+   for (int i = 0; i < mBufferPlaneCount; i++) {
+-    zwp_linux_buffer_params_v1_add(params, mDmabufFds[i], i, mOffsets[i],
+-                                   mStrides[i], mBufferModifier >> 32,
++    zwp_linux_buffer_params_v1_add(params, mRGBA.mDmabufFds[i], i,
++                                   mRGBA.mOffsets[i],
++                                   mRGBA.mStrides[i], mBufferModifier >> 32,
+                                    mBufferModifier & 0xffffffff);
+   }
+   zwp_linux_buffer_params_v1_add_listener(params, &params_listener, this);
+ 
+-  if (mFastWLBufferCreation) {
+-    mWLBuffer = zwp_linux_buffer_params_v1_create_immed(
+-        params, mWidth, mHeight, mGmbFormat->mFormat, BUFFER_FLAGS);
++  if (mRGBA.mFastWLBufferCreation) {
++    mRGBA.mWLBuffer = zwp_linux_buffer_params_v1_create_immed(
++        params, mRGBA.mWidth, mRGBA.mHeight, mRGBA.mGmbFormat->mFormat, BUFFER_FLAGS);
+     /* When not using explicit synchronization listen to
+      * wl_buffer.release for release notifications, otherwise we
+      * are going to use zwp_linux_buffer_release_v1. */
+     if (!display->IsExplicitSyncEnabled()) {
+-      wl_buffer_add_listener(mWLBuffer, &buffer_listener, this);
++      wl_buffer_add_listener(mRGBA.mWLBuffer, &buffer_listener, this);
+     }
+   } else {
+-    zwp_linux_buffer_params_v1_create(params, mWidth, mHeight,
+-                                      mGmbFormat->mFormat, BUFFER_FLAGS);
++    zwp_linux_buffer_params_v1_create(params, mRGBA.mWidth, mRGBA.mHeight,
++                                      mRGBA.mGmbFormat->mFormat, BUFFER_FLAGS);
+   }
+ 
+   return true;
+ }
+ 
+-bool WaylandDMABufSurface::IsEGLSupported(mozilla::gl::GLContext* aGLContext) {
++bool WaylandDMABufSurface::IsEGLSupported() {
+   auto* egl = gl::GLLibraryEGL::Get();
+   return egl->HasKHRImageBase();
+ }
+ 
+-bool WaylandDMABufSurface::CreateEGLImage(mozilla::gl::GLContext* aGLContext) {
+-  MOZ_ASSERT(mGbmBufferObject, "Can't create EGLImage, missing dmabuf object!");
+-  MOZ_ASSERT(!mEGLImage && !mGLFbo, "EGLImage is already created!");
++bool WaylandDMABufSurface::CreateEGLImage(mozilla::gl::GLContext* aGLContext,
++                                          int aPlane) {
++#ifdef DEBUG
++  if (mBufferType == BUFFER_RGBA) {
++    MOZ_ASSERT(aPlane == 0, "Invalid surface plane!");
++    MOZ_ASSERT(!mRGBA.mGbmBufferObject,
++               "Can't create EGLImage, missing dmabuf object!");
++    MOZ_ASSERT(!mRGBA.mEGLImage && !mRGBA.mGLFbo,
++               "EGLImage is already created!");
++  }
++#endif
+ 
+   nsTArray<EGLint> attribs;
+   attribs.AppendElement(LOCAL_EGL_WIDTH);
+-  attribs.AppendElement(mWidth);
++  attribs.AppendElement(mBufferType == BUFFER_RGBA ?
++                        mRGBA.mWidth : mYUV.mWidth[aPlane]);
+   attribs.AppendElement(LOCAL_EGL_HEIGHT);
+-  attribs.AppendElement(mHeight);
++  attribs.AppendElement(mBufferType == BUFFER_RGBA ?
++                        mRGBA.mHeight : mYUV.mHeight[aPlane]);
+   attribs.AppendElement(LOCAL_EGL_LINUX_DRM_FOURCC_EXT);
+-  attribs.AppendElement(mGmbFormat->mFormat);
+-#define ADD_PLANE_ATTRIBS(plane_idx)                                        \
++  attribs.AppendElement(mBufferType == BUFFER_RGBA ?
++                        mRGBA.mGmbFormat->mFormat : mYUV.mDrmFormats[aPlane]);
++
++#define ADD_PLANE_ATTRIBS_RGBA(plane_idx)                                   \
+   {                                                                         \
+     attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_FD_EXT);     \
+-    attribs.AppendElement(mDmabufFds[plane_idx]);                           \
++    attribs.AppendElement(mRGBA.mDmabufFds[plane_idx]);                     \
+     attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_OFFSET_EXT); \
+-    attribs.AppendElement((int)mOffsets[plane_idx]);                        \
++    attribs.AppendElement((int)mRGBA.mOffsets[plane_idx]);                  \
+     attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_PITCH_EXT);  \
+-    attribs.AppendElement((int)mStrides[plane_idx]);                        \
++    attribs.AppendElement((int)mRGBA.mStrides[plane_idx]);                  \
+     if (mBufferModifier != DRM_FORMAT_MOD_INVALID) {                        \
+       attribs.AppendElement(                                                \
+           LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_MODIFIER_LO_EXT);            \
+       attribs.AppendElement(mBufferModifier & 0xFFFFFFFF);                  \
+       attribs.AppendElement(                                                \
+           LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_MODIFIER_HI_EXT);            \
+       attribs.AppendElement(mBufferModifier >> 32);                         \
+     }                                                                       \
+   }
+-  ADD_PLANE_ATTRIBS(0);
+-  if (mBufferPlaneCount > 1) ADD_PLANE_ATTRIBS(1);
+-  if (mBufferPlaneCount > 2) ADD_PLANE_ATTRIBS(2);
+-  if (mBufferPlaneCount > 3) ADD_PLANE_ATTRIBS(3);
+-#undef ADD_PLANE_ATTRIBS
++
++#define ADD_PLANE_ATTRIBS_YUV(plane_idx)                                    \
++  {                                                                         \
++    attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_FD_EXT);     \
++    attribs.AppendElement(mYUV.mDmabufFd);                                  \
++    attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_OFFSET_EXT); \
++    attribs.AppendElement((int)mYUV.mOffsets[aPlane]);                      \
++    attribs.AppendElement(LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_PITCH_EXT);  \
++    attribs.AppendElement((int)mYUV.mStrides[aPlane]);                      \
++    if (mBufferModifier != DRM_FORMAT_MOD_INVALID) {                        \
++      attribs.AppendElement(                                                \
++          LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_MODIFIER_LO_EXT);            \
++      attribs.AppendElement(mBufferModifier & 0xFFFFFFFF);                  \
++      attribs.AppendElement(                                                \
++          LOCAL_EGL_DMA_BUF_PLANE##plane_idx##_MODIFIER_HI_EXT);            \
++      attribs.AppendElement(mBufferModifier >> 32);                         \
++    }                                                                       \
++  }
++
++  if (mBufferType == BUFFER_RGBA) {
++    ADD_PLANE_ATTRIBS_RGBA(0);
++    if (mBufferPlaneCount > 1) ADD_PLANE_ATTRIBS_RGBA(1);
++    if (mBufferPlaneCount > 2) ADD_PLANE_ATTRIBS_RGBA(2);
++    if (mBufferPlaneCount > 3) ADD_PLANE_ATTRIBS_RGBA(3);
++  } else  {
++    ADD_PLANE_ATTRIBS_YUV(0);
++  }
++#undef ADD_PLANE_ATTRIBS_RGBA
++#undef ADD_PLANE_ATTRIBS_YUV
++
+   attribs.AppendElement(LOCAL_EGL_NONE);
+ 
+   auto* egl = gl::GLLibraryEGL::Get();
+-  mEGLImage = egl->fCreateImage(egl->Display(), LOCAL_EGL_NO_CONTEXT,
+-                                LOCAL_EGL_LINUX_DMA_BUF_EXT, nullptr,
+-                                attribs.Elements());
+-  if (mEGLImage == LOCAL_EGL_NO_IMAGE) {
++  EGLImageKHR image = egl->fCreateImage(egl->Display(), LOCAL_EGL_NO_CONTEXT,
++                                        LOCAL_EGL_LINUX_DMA_BUF_EXT, nullptr,
++                                        attribs.Elements());
++  if (image == LOCAL_EGL_NO_IMAGE) {
+     NS_WARNING("EGLImageKHR creation failed");
+     return false;
+   }
++  if (mBufferType == BUFFER_YUV) {
++    mYUV.mEGLImage[aPlane] = image;
++  } else {
++    mRGBA.mEGLImage = image;
++  }
++
++  EGLImageKHR* pEGLImage = (mBufferType == BUFFER_YUV) ?
++                           mYUV.mEGLImage + aPlane : &mRGBA.mEGLImage;
++  GLuint* pGLFbo = (mBufferType == BUFFER_YUV) ?
++                     mYUV.mGLFbo + aPlane : &mRGBA.mGLFbo;
++  GLuint* pTexture = (mBufferType == BUFFER_YUV) ?
++                      mYUV.mTexture + aPlane : &mRGBA.mTexture;
+ 
+   aGLContext->MakeCurrent();
+ 
+   int savedFb = 0;
+   aGLContext->fGetIntegerv(LOCAL_GL_FRAMEBUFFER_BINDING, &savedFb);
+ 
+-  aGLContext->fGenTextures(1, &mTexture);
+-  aGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, mTexture);
++  aGLContext->fGenTextures(1, pTexture);
++  aGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, *pTexture);
+   aGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_S,
+                              LOCAL_GL_CLAMP_TO_EDGE);
+   aGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_T,
+                              LOCAL_GL_CLAMP_TO_EDGE);
+   aGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MAG_FILTER,
+                              LOCAL_GL_LINEAR);
+   aGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MIN_FILTER,
+                              LOCAL_GL_LINEAR);
+ 
+-  aGLContext->fEGLImageTargetTexture2D(LOCAL_GL_TEXTURE_2D, mEGLImage);
+-  aGLContext->fGenFramebuffers(1, &mGLFbo);
+-  aGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mGLFbo);
++  aGLContext->fEGLImageTargetTexture2D(LOCAL_GL_TEXTURE_2D, *pEGLImage);
++  aGLContext->fGenFramebuffers(1, pGLFbo);
++  aGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, *pGLFbo);
+   aGLContext->fFramebufferTexture2D(LOCAL_GL_FRAMEBUFFER,
+                                     LOCAL_GL_COLOR_ATTACHMENT0,
+-                                    LOCAL_GL_TEXTURE_2D, mTexture, 0);
++                                    LOCAL_GL_TEXTURE_2D, *pTexture, 0);
+   bool ret = (aGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER) ==
+               LOCAL_GL_FRAMEBUFFER_COMPLETE);
+   if (!ret) {
+     NS_WARNING("WaylandDMABufSurface - FBO creation failed");
+   }
+   aGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, savedFb);
+ 
+   mGL = aGLContext;
+ 
+   return ret;
+ }
+ 
+-void WaylandDMABufSurface::ReleaseEGLImage() {
+-  if (mEGLImage) {
+-    auto* egl = gl::GLLibraryEGL::Get();
+-    egl->fDestroyImage(egl->Display(), mEGLImage);
+-    mEGLImage = nullptr;
++/*
++$1 = (const VADRMPRIMESurfaceDescriptor &) @0x7fffc3cfda60: {
++  fourcc = 842094158,
++  width = 640,
++  height = 368,
++  num_objects = 1,
++  objects = {{
++      fd = 75,
++      size = 368640,
++      drm_format_modifier = 72057594037927938
++    }, {
++      fd = -1431655766,
++      size = 2863311530,
++      drm_format_modifier = 12297829382473034410
++    }, {
++      fd = -1431655766,
++      size = 2863311530,
++      drm_format_modifier = 12297829382473034410
++    }, {
++      fd = -1431655766,
++      size = 2863311530,
++      drm_format_modifier = 12297829382473034410
++    }},
++  num_layers = 2,
++  layers = {{
++      drm_format = 538982482,
++      num_planes = 1,
++      object_index = {0, 2863311530, 2863311530, 2863311530},
++      offset = {0, 2863311530, 2863311530, 2863311530},
++      pitch = {640, 2863311530, 2863311530, 2863311530}
++    }, {
++      drm_format = 943215175,
++      num_planes = 1,
++      object_index = {0, 2863311530, 2863311530, 2863311530},
++      offset = {245760, 2863311530, 2863311530, 2863311530},
++      pitch = {640, 2863311530, 2863311530, 2863311530}
++    }, {
++      drm_format = 2863311530,
++      num_planes = 2863311530,
++      object_index = {2863311530, 2863311530, 2863311530, 2863311530},
++      offset = {2863311530, 2863311530, 2863311530, 2863311530},
++      pitch = {2863311530, 2863311530, 2863311530, 2863311530}
++    }, {
++      drm_format = 2863311530,
++      num_planes = 2863311530,
++      object_index = {2863311530, 2863311530, 2863311530, 2863311530},
++      offset = {2863311530, 2863311530, 2863311530, 2863311530},
++      pitch = {2863311530, 2863311530, 2863311530, 2863311530}
++    }}
++}
++*/
++
++#if 0
++static already_AddRefed<gl::GLContext> CreateGLContextEGL() {
++  nsCString discardFailureId;
++  if (!gl::GLLibraryEGL::EnsureInitialized(true, &discardFailureId)) {
++    gfxCriticalNote << "Failed to load EGL library: " << discardFailureId.get();
++    return nullptr;
++  }
++  // Create GLContext with dummy EGLSurface.
++  RefPtr<gl::GLContext> gl =
++      gl::GLContextProviderEGL::CreateForCompositorWidget(nullptr, true, true);
++  if (!gl || !gl->MakeCurrent()) {
++    gfxCriticalNote << "Failed GL context creation for WebRender: "
++                    << gfx::hexa(gl.get());
++    return nullptr;
++  }
++  return gl.forget();
++}
++#endif
++
++bool WaylandDMABufSurface::Create(const VADRMPRIMESurfaceDescriptor& aDesc) {
++  MOZ_ASSERT(aDesc.num_objects == 1, "We support VAAPI surfaces with one object!");
++  if (aDesc.num_objects > 1) {
++    return false;
+   }
+ 
+-  if (mGLFbo) {
+-    if (mGL->MakeCurrent()) {
+-      mGL->fDeleteTextures(1, &mTexture);
+-      mGL->fDeleteFramebuffers(1, &mGLFbo);
++  if (aDesc.fourcc != VA_FOURCC_NV12) {
++    return false;
++  }
++  mSurfaceFormat = gfx::SurfaceFormat::NV12;
++  // TODO? SurfaceFormat::YUV422;
++
++  mBufferType = BUFFER_YUV;
++  mBufferPlaneCount = aDesc.num_layers;
++  mBufferModifier = aDesc.objects[0].drm_format_modifier;
++
++  for(unsigned int i = 0; i < aDesc.num_layers; i++) {
++    MOZ_ASSERT(aDesc.layers[i].num_planes == 1,
++      "We support VAAPI surfaces with one plane per layer!");
++    if (aDesc.layers[i].num_planes > 1) {
++      return false;
+     }
+-    mTexture = 0;
+-    mGLFbo = 0;
++    MOZ_ASSERT(aDesc.layers[i].object_index[0] == 0);
++    mYUV.mDmabufFd = aDesc.objects[aDesc.layers[i].object_index[0]].fd;
++    mYUV.mDrmFormats[i] = aDesc.layers[i].drm_format;
++    mYUV.mOffsets[i] = aDesc.layers[i].offset[0];
++    mYUV.mStrides[i] = aDesc.layers[i].pitch[0];
++    mYUV.mWidth[i] = aDesc.width >> i; // TODO: YUV NV12 hack
++    mYUV.mHeight[i] = aDesc.height >> i;
+   }
+ 
++  //static RefPtr<mozilla::gl::GLContext> glcontext = CreateGLContextEGL();
++  //bool im1 = CreateEGLImage(glcontext, 0);
++  //bool im2 = CreateEGLImage(glcontext, 1);
++
++  return true; //im1 && im2;
++}
++
++static void ReleaseGLResources(mozilla::gl::GLContext* aGL,
++                               EGLImageKHR* pEGLImage, GLuint* pGLFbo,
++                               GLuint* pTexture) {
++  if (*pEGLImage) {
++    auto* egl = gl::GLLibraryEGL::Get();
++    egl->fDestroyImage(egl->Display(), *pEGLImage);
++    *pEGLImage = nullptr;
++  }
++
++  if (*pGLFbo) {
++    if (aGL->MakeCurrent()) {
++      aGL->fDeleteTextures(1, pTexture);
++      aGL->fDeleteFramebuffers(1, pGLFbo);
++    }
++    *pTexture = 0;
++    *pGLFbo = 0;
++  }
++}
++
++void WaylandDMABufSurface::ReleaseEGLImage() {
++  if (mBufferType == BUFFER_YUV) {
++    for (int i = 0; i < mBufferPlaneCount; i++) {
++      ReleaseGLResources(mGL, mYUV.mEGLImage+i, mYUV.mGLFbo+i, mYUV.mTexture+i);
++    }
++  } else {
++    ReleaseGLResources(mGL, &mRGBA.mEGLImage, &mRGBA.mGLFbo, &mRGBA.mTexture);
++  }
+   mGL = nullptr;
+ }
+ 
+-void WaylandDMABufSurface::ReleaseDMABufSurface() {
++void WaylandDMABufSurface::ReleaseRGBASurface() {
+   MOZ_ASSERT(!IsMapped(), "We can't release mapped buffer!");
+ 
+   ReleaseEGLImage();
+ 
+-  if (mWLBuffer) {
+-    wl_buffer_destroy(mWLBuffer);
+-    mWLBuffer = nullptr;
++  if (mRGBA.mWLBuffer) {
++    wl_buffer_destroy(mRGBA.mWLBuffer);
++    mRGBA.mWLBuffer = nullptr;
+   }
+ 
+   for (int i = 0; i < mBufferPlaneCount; i++) {
+-    if (mDmabufFds[i] >= 0) {
+-      close(mDmabufFds[i]);
+-      mDmabufFds[i] = 0;
++    if (mRGBA.mDmabufFds[i] >= 0) {
++      close(mRGBA.mDmabufFds[i]);
++      mRGBA.mDmabufFds[i] = 0;
+     }
+   }
+ 
+-  if (mGbmBufferObject) {
+-    nsGbmLib::Destroy(mGbmBufferObject);
+-    mGbmBufferObject = nullptr;
++  if (mRGBA.mGbmBufferObject) {
++    nsGbmLib::Destroy(mRGBA.mGbmBufferObject);
++    mRGBA.mGbmBufferObject = nullptr;
++  }
++}
++
++void WaylandDMABufSurface::ReleaseYUVSurface() {
++  ReleaseEGLImage();
++
++  if (mYUV.mDmabufFd >= 0) {
++    close(mYUV.mDmabufFd);
++    mYUV.mDmabufFd = 0;
+   }
+ }
+ 
+ void* WaylandDMABufSurface::MapInternal(uint32_t aX, uint32_t aY,
+                                         uint32_t aWidth, uint32_t aHeight,
+                                         uint32_t* aStride, int aGbmFlags) {
+   NS_ASSERTION(!IsMapped(), "Already mapped!");
+-  if (mSurfaceFlags & DMABUF_USE_MODIFIERS) {
++  if (mRGBA.mSurfaceFlags & DMABUF_USE_MODIFIERS) {
+     NS_WARNING("We should not map dmabuf surfaces with modifiers!");
+   }
+ 
+   void* map_data = nullptr;
+-  mMappedRegionStride = 0;
+-  mMappedRegion = nsGbmLib::Map(mGbmBufferObject, aX, aY, aWidth, aHeight,
+-                                aGbmFlags, &mMappedRegionStride, &map_data);
++  mRGBA.mMappedRegionStride = 0;
++  mRGBA.mMappedRegion = nsGbmLib::Map(mRGBA.mGbmBufferObject, aX, aY,
++                                      aWidth, aHeight,
++                                      aGbmFlags, &mRGBA.mMappedRegionStride,
++                                      &map_data);
+   if (aStride) {
+-    *aStride = mMappedRegionStride;
++    *aStride = mRGBA.mMappedRegionStride;
+   }
+-  return mMappedRegion;
++  return mRGBA.mMappedRegion;
+ }
+ 
+ void* WaylandDMABufSurface::MapReadOnly(uint32_t aX, uint32_t aY,
+                                         uint32_t aWidth, uint32_t aHeight,
+                                         uint32_t* aStride) {
+   return MapInternal(aX, aY, aWidth, aHeight, aStride, GBM_BO_TRANSFER_READ);
+ }
+ 
+ void* WaylandDMABufSurface::MapReadOnly(uint32_t* aStride) {
+-  return MapInternal(0, 0, mWidth, mHeight, aStride, GBM_BO_TRANSFER_READ);
++  return MapInternal(0, 0, mRGBA.mWidth, mRGBA.mHeight, aStride, GBM_BO_TRANSFER_READ);
+ }
+ 
+ void* WaylandDMABufSurface::Map(uint32_t aX, uint32_t aY, uint32_t aWidth,
+                                 uint32_t aHeight, uint32_t* aStride) {
+   return MapInternal(aX, aY, aWidth, aHeight, aStride,
+                      GBM_BO_TRANSFER_READ_WRITE);
+ }
+ 
+ void* WaylandDMABufSurface::Map(uint32_t* aStride) {
+-  return MapInternal(0, 0, mWidth, mHeight, aStride,
++  return MapInternal(0, 0, mRGBA.mWidth, mRGBA.mHeight, aStride,
+                      GBM_BO_TRANSFER_READ_WRITE);
+ }
+ 
+ void WaylandDMABufSurface::Unmap() {
+-  if (mMappedRegion) {
+-    nsGbmLib::Unmap(mGbmBufferObject, mMappedRegion);
+-    mMappedRegion = nullptr;
+-    mMappedRegionStride = 0;
++  if (mRGBA.mMappedRegion) {
++    nsGbmLib::Unmap(mRGBA.mGbmBufferObject, mRGBA.mMappedRegion);
++    mRGBA.mMappedRegion = nullptr;
++    mRGBA.mMappedRegionStride = 0;
+   }
+ }
+ 
+ bool WaylandDMABufSurface::Resize(int aWidth, int aHeight) {
+-  if (aWidth == mWidth && aHeight == mHeight) {
++  if (aWidth == mRGBA.mWidth && aHeight == mRGBA.mHeight) {
+     return true;
+   }
+ 
+   if (IsMapped()) {
+     NS_WARNING("We can't resize mapped surface!");
+     return false;
+   }
+ 
+-  ReleaseDMABufSurface();
+-  if (Create(aWidth, aHeight, mSurfaceFlags)) {
+-    if (mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
++  ReleaseRGBASurface();
++  if (Create(aWidth, aHeight, mRGBA.mSurfaceFlags)) {
++    if (mRGBA.mSurfaceFlags & DMABUF_CREATE_WL_BUFFER) {
+       return CreateWLBuffer();
+     }
+   }
+ 
+   return false;
+ }
+ 
+ bool WaylandDMABufSurface::CopyFrom(
+@@ -513,35 +765,45 @@ bool WaylandDMABufSurface::CopyFrom(
+ void WaylandDMABufSurface::Clear() {
+   uint32_t destStride;
+   void* destData = Map(&destStride);
+   memset(destData, 0, GetHeight() * destStride);
+   Unmap();
+ }
+ 
+ bool WaylandDMABufSurface::HasAlpha() {
+-  return mGmbFormat ? mGmbFormat->mHasAlpha : true;
++  return mRGBA.mGmbFormat ? mRGBA.mGmbFormat->mHasAlpha : true;
+ }
+ 
+ gfx::SurfaceFormat WaylandDMABufSurface::GetFormat() {
+-  return HasAlpha() ? gfx::SurfaceFormat::B8G8R8A8
+-                    : gfx::SurfaceFormat::B8G8R8X8;
++  return mSurfaceFormat;
+ }
+ 
+ already_AddRefed<WaylandDMABufSurface>
+-WaylandDMABufSurface::CreateDMABufSurface(int aWidth, int aHeight,
+-                                          int aWaylandDMABufSurfaceFlags) {
+-  RefPtr<WaylandDMABufSurface> surf = new WaylandDMABufSurface();
++WaylandDMABufSurface::CreateRGBASurface(int aWidth, int aHeight,
++                                        int aWaylandDMABufSurfaceFlags) {
++  RefPtr<WaylandDMABufSurface> surf = new WaylandDMABufSurface(BUFFER_RGBA);
+   if (!surf->Create(aWidth, aHeight, aWaylandDMABufSurfaceFlags)) {
+     return nullptr;
+   }
+   return surf.forget();
+ }
+ 
+ already_AddRefed<WaylandDMABufSurface>
+-WaylandDMABufSurface::CreateDMABufSurface(
+-    const mozilla::layers::SurfaceDescriptor& aDesc) {
+-  RefPtr<WaylandDMABufSurface> surf = new WaylandDMABufSurface();
++WaylandDMABufSurface::CreateSurface(
++    const mozilla::layers::SurfaceDescriptorDMABuf& aDesc) {
++  RefPtr<WaylandDMABufSurface> surf =
++    new WaylandDMABufSurface((BufferType)aDesc.bufferType());
+   if (!surf->Create(aDesc)) {
+     return nullptr;
+   }
+   return surf.forget();
+ }
++
++already_AddRefed<WaylandDMABufSurface>
++WaylandDMABufSurface::CreateYUVSurface(
++    const VADRMPRIMESurfaceDescriptor& aDesc) {
++  RefPtr<WaylandDMABufSurface> surf = new WaylandDMABufSurface(BUFFER_YUV);
++  if (!surf->Create(aDesc)) {
++    return nullptr;
++  }
++  return surf.forget();
++}
+diff --git a/widget/gtk/WaylandDMABufSurface.h b/widget/gtk/WaylandDMABufSurface.h
+--- a/widget/gtk/WaylandDMABufSurface.h
++++ b/widget/gtk/WaylandDMABufSurface.h
+@@ -5,25 +5,28 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef WaylandDMABufSurface_h__
+ #define WaylandDMABufSurface_h__
+ 
+ #include <stdint.h>
+ #include "GLContextTypes.h"
+ #include "mozilla/widget/nsWaylandDisplay.h"
++#include <va/va.h>
++#include <va/va_drmcommon.h>
+ 
+ typedef void* EGLImageKHR;
+ typedef void* EGLSyncKHR;
+ 
+ #define DMABUF_BUFFER_PLANES 4
+ 
+ namespace mozilla {
+ namespace layers {
+ class SurfaceDescriptor;
++class SurfaceDescriptorDMABuf;
+ }
+ }  // namespace mozilla
+ 
+ typedef enum {
+   // Use alpha pixel format
+   DMABUF_ALPHA = 1 << 0,
+   // Surface is used as texture and may be also shared
+   DMABUF_TEXTURE = 1 << 1,
+@@ -34,97 +37,158 @@ typedef enum {
+   // so we can't do direct rendering to it.
+   DMABUF_USE_MODIFIERS = 1 << 3,
+ } WaylandDMABufSurfaceFlags;
+ 
+ class WaylandDMABufSurface {
+  public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WaylandDMABufSurface)
+ 
+-  static already_AddRefed<WaylandDMABufSurface> CreateDMABufSurface(
++  enum BufferType {
++    BUFFER_RGBA,
++    BUFFER_YUV,
++  };
++
++  static already_AddRefed<WaylandDMABufSurface> CreateRGBASurface(
+       int aWidth, int aHeight, int aWaylandDMABufSurfaceFlags);
+-  static already_AddRefed<WaylandDMABufSurface> CreateDMABufSurface(
+-      const mozilla::layers::SurfaceDescriptor& aDesc);
++  static already_AddRefed<WaylandDMABufSurface> CreateSurface(
++      const mozilla::layers::SurfaceDescriptorDMABuf& aDesc);
++  static already_AddRefed<WaylandDMABufSurface> CreateYUVSurface(
++      const VADRMPRIMESurfaceDescriptor& aDesc);
+ 
+   bool Create(int aWidth, int aHeight, int aWaylandDMABufSurfaceFlags);
+   bool Create(const mozilla::layers::SurfaceDescriptor& aDesc);
++  bool Create(const VADRMPRIMESurfaceDescriptor& aDesc);
+ 
+   bool Serialize(mozilla::layers::SurfaceDescriptor& aOutDescriptor);
+ 
+   bool Resize(int aWidth, int aHeight);
+   void Clear();
+ 
+   bool CopyFrom(class WaylandDMABufSurface* aSourceSurface);
+ 
+-  int GetWidth() { return mWidth; };
+-  int GetHeight() { return mHeight; };
++  int GetWidth(int aPlane = 0) {
++    return mBufferType == BUFFER_YUV ? mYUV.mWidth[aPlane] : mRGBA.mWidth;
++  }
++  int GetHeight(int aPlane = 0) {
++    return mBufferType == BUFFER_YUV ? mYUV.mHeight[aPlane] : mRGBA.mHeight;
++  }
+   mozilla::gfx::SurfaceFormat GetFormat();
+   bool HasAlpha();
+ 
+   void* MapReadOnly(uint32_t aX, uint32_t aY, uint32_t aWidth, uint32_t aHeight,
+                     uint32_t* aStride = nullptr);
+   void* MapReadOnly(uint32_t* aStride = nullptr);
+   void* Map(uint32_t aX, uint32_t aY, uint32_t aWidth, uint32_t aHeight,
+             uint32_t* aStride = nullptr);
+   void* Map(uint32_t* aStride = nullptr);
+-  void* GetMappedRegion() { return mMappedRegion; };
+-  uint32_t GetMappedRegionStride() { return mMappedRegionStride; };
+-  bool IsMapped() { return (mMappedRegion != nullptr); };
++  void* GetMappedRegion() { return mRGBA.mMappedRegion; };
++  uint32_t GetMappedRegionStride() { return mRGBA.mMappedRegionStride; };
++  bool IsMapped() { return (mRGBA.mMappedRegion != nullptr); };
+   void Unmap();
+ 
+-  bool IsEGLSupported(mozilla::gl::GLContext* aGLContext);
+-  bool CreateEGLImage(mozilla::gl::GLContext* aGLContext);
++  bool IsEGLSupported();
++  bool CreateEGLImage(mozilla::gl::GLContext* aGLContext, int aPlane = 0);
+   void ReleaseEGLImage();
+-  EGLImageKHR GetEGLImage() { return mEGLImage; };
+-  GLuint GetGLTexture() { return mTexture; };
++
++  EGLImageKHR GetEGLImage(int aPlane = 0) {
++    return mBufferType == BUFFER_YUV ? mYUV.mEGLImage[aPlane] : mRGBA.mEGLImage;
++  }
++  GLuint GetGLTexture(int aPlane = 0) {
++    return mBufferType == BUFFER_YUV ? mYUV.mTexture[aPlane] : mRGBA.mTexture;
++  }
+ 
+   void SetWLBuffer(struct wl_buffer* aWLBuffer);
+   wl_buffer* GetWLBuffer();
+ 
+-  void WLBufferDetach() { mWLBufferAttached = false; };
+-  bool WLBufferIsAttached() { return mWLBufferAttached; };
+-  void WLBufferSetAttached() { mWLBufferAttached = true; };
++  void WLBufferDetach() {
++    mRGBA.mWLBufferAttached = false;
++  }
++  bool WLBufferIsAttached() {
++    return mRGBA.mWLBufferAttached;
++  }
++  void WLBufferSetAttached() {
++    mRGBA.mWLBufferAttached = true;
++  }
++
++  WaylandDMABufSurface(BufferType aBufferType);
+ 
+-  WaylandDMABufSurface();
++  void SetYUVColorSpace(mozilla::gfx::YUVColorSpace aColorSpace) {
++    mYUV.mColorSpace = aColorSpace;
++  }
++  mozilla::gfx::YUVColorSpace GetYUVColorSpace() const {
++    return mYUV.mColorSpace;
++  }
++
++  // TODO
++  bool IsFullRange() const {
++    return mBufferType == BUFFER_YUV;
++  }
++
++  uint32_t GetPlaneCount() {
++    return mBufferType == BUFFER_YUV ? mBufferPlaneCount : 1;
++  };
+ 
+  private:
+   ~WaylandDMABufSurface();
+ 
+-  void ReleaseDMABufSurface();
++  void ReleaseRGBASurface();
++  void ReleaseYUVSurface();
+ 
+   bool CreateWLBuffer();
+ 
+-  void FillFdData(struct gbm_import_fd_data& aData);
+-  void FillFdData(struct gbm_import_fd_modifier_data& aData);
+-  void ImportSurfaceDescriptor(const mozilla::layers::SurfaceDescriptor& aDesc);
++  void FillFdDataRGBA(struct gbm_import_fd_data& aData);
++  void FillFdDataRGBA(struct gbm_import_fd_modifier_data& aData);
++  void ImportSurfaceDescriptorRGBA(const mozilla::layers::SurfaceDescriptorDMABuf& aDesc);
++  void ImportSurfaceDescriptorYUV(const mozilla::layers::SurfaceDescriptorDMABuf& aDesc);
+ 
+   void* MapInternal(uint32_t aX, uint32_t aY, uint32_t aWidth, uint32_t aHeight,
+                     uint32_t* aStride, int aGbmFlags);
+ 
+  private:
+-  int mSurfaceFlags;
+-
+-  int mWidth;
+-  int mHeight;
+-  mozilla::widget::GbmFormat* mGmbFormat;
++  BufferType mBufferType;
+ 
+-  wl_buffer* mWLBuffer;
+-  void* mMappedRegion;
+-  uint32_t mMappedRegionStride;
+-
+-  struct gbm_bo* mGbmBufferObject;
++  mozilla::gfx::SurfaceFormat mSurfaceFormat;
+   uint64_t mBufferModifier;
+   int mBufferPlaneCount;
+-  int mDmabufFds[DMABUF_BUFFER_PLANES];
+-  uint32_t mStrides[DMABUF_BUFFER_PLANES];
+-  uint32_t mOffsets[DMABUF_BUFFER_PLANES];
+-  uint32_t mGbmBufferFlags;
++
++  typedef struct _BufferRGBA {
++    int mSurfaceFlags;
++    int mWidth;
++    int mHeight;
++    mozilla::widget::GbmFormat* mGmbFormat;
++    struct gbm_bo* mGbmBufferObject;
++    wl_buffer* mWLBuffer;
++    void* mMappedRegion;
++    uint32_t mMappedRegionStride;
++    int mDmabufFds[DMABUF_BUFFER_PLANES];
++    uint32_t mStrides[DMABUF_BUFFER_PLANES];
++    uint32_t mOffsets[DMABUF_BUFFER_PLANES];
++    uint32_t mGbmBufferFlags;
++    EGLImageKHR mEGLImage;
++    GLuint mGLFbo;
++    GLuint mTexture;
++    bool mWLBufferAttached;
++    bool mFastWLBufferCreation;
++  } BufferRGBA;
++
++  typedef struct _BufferYUV {
++    int mDmabufFd;
++    int mWidth[DMABUF_BUFFER_PLANES];
++    int mHeight[DMABUF_BUFFER_PLANES];
++    uint32_t mStrides[DMABUF_BUFFER_PLANES];
++    uint32_t mOffsets[DMABUF_BUFFER_PLANES];
++    uint32_t mDrmFormats[DMABUF_BUFFER_PLANES];
++    EGLImageKHR mEGLImage[DMABUF_BUFFER_PLANES];
++    GLuint mGLFbo[DMABUF_BUFFER_PLANES];
++    GLuint mTexture[DMABUF_BUFFER_PLANES];
++    mozilla::gfx::YUVColorSpace mColorSpace;
++  } BufferYUV;
++
++  union {
++    BufferRGBA mRGBA;
++    BufferYUV  mYUV;
++  };
+ 
+   RefPtr<mozilla::gl::GLContext> mGL;
+-  EGLImageKHR mEGLImage;
+-  GLuint mGLFbo;
+-  GLuint mTexture;
+-
+-  bool mWLBufferAttached;
+-  bool mFastWLBufferCreation;
+ };
+ 
+ #endif
+diff --git a/widget/gtk/WindowSurfaceWayland.cpp b/widget/gtk/WindowSurfaceWayland.cpp
+--- a/widget/gtk/WindowSurfaceWayland.cpp
++++ b/widget/gtk/WindowSurfaceWayland.cpp
+@@ -431,17 +431,17 @@ already_AddRefed<gfx::DrawTarget> Window
+   return gfxPlatform::CreateDrawTargetForData(
+       static_cast<unsigned char*>(mShmPool.GetImageData()), lockSize,
+       BUFFER_BPP * mWidth, GetSurfaceFormat());
+ }
+ 
+ WindowBackBufferDMABuf::WindowBackBufferDMABuf(
+     WindowSurfaceWayland* aWindowSurfaceWayland, int aWidth, int aHeight)
+     : WindowBackBuffer(aWindowSurfaceWayland) {
+-  mDMAbufSurface = WaylandDMABufSurface::CreateDMABufSurface(
++  mDMAbufSurface = WaylandDMABufSurface::CreateRGBASurface(
+       aWidth, aHeight, DMABUF_ALPHA | DMABUF_CREATE_WL_BUFFER);
+   LOGWAYLAND(
+       ("WindowBackBufferDMABuf::WindowBackBufferDMABuf [%p] Created DMABuf "
+        "buffer [%d x %d]\n",
+        (void*)this, aWidth, aHeight));
+ }
+ 
+ WindowBackBufferDMABuf::~WindowBackBufferDMABuf() {}
